@@ -5,7 +5,7 @@
   --accent-strong: #1b5f52;
   --panel: rgba(255, 251, 240, 0.92);
   --shadow: 0 22px 60px rgba(51, 39, 21, 0.18);
-  --board-grid: rgba(91, 76, 47, 0.11);
+  --board-grid: rgba(70, 57, 34, 0.16);
   --yellow: #f8ee8b;
   --pink: #f5b7d2;
   --blue: #a7d8fb;
@@ -52,6 +52,12 @@ button:hover {
   transform: translateY(-1px);
 }
 
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
 button.active {
   background: #163f37;
 }
@@ -70,6 +76,53 @@ textarea {
 label {
   display: grid;
   gap: 0.45rem;
+}
+
+.pin-input-group {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.pin-inputs {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.pin-digit-input {
+  padding: 0.85rem 0.25rem;
+  text-align: center;
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.pin-digit-input::-webkit-outer-spin-button,
+.pin-digit-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.checkbox-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.checkbox-row input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+
+.secondary-button {
+  background: rgba(37, 54, 49, 0.14);
+  color: var(--ink);
+  box-shadow: none;
+}
+
+.secondary-button:hover {
+  background: rgba(37, 54, 49, 0.22);
 }
 
 .home-shell {
@@ -136,6 +189,20 @@ label {
   gap: 1rem;
 }
 
+.settings-card {
+  align-items: start;
+}
+
+.settings-form {
+  align-content: start;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
 .panel {
   display: grid;
   gap: 1rem;
@@ -143,6 +210,16 @@ label {
   border-radius: 24px;
   background: var(--panel);
   border: 1px solid rgba(103, 82, 47, 0.12);
+}
+
+.join-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.join-actions button[type="submit"] {
+  flex: 1;
 }
 
 .panel h2,
@@ -163,12 +240,18 @@ label {
   position: relative;
   min-height: 100vh;
   overflow: hidden;
-  background:
-    linear-gradient(90deg, transparent 24px, var(--board-grid) 25px, transparent 26px),
-    linear-gradient(transparent 24px, var(--board-grid) 25px, transparent 26px),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(234, 218, 184, 0.65));
-  background-size: 80px 80px, 80px 80px, auto;
+  background: linear-gradient(180deg, rgba(247, 240, 224, 0.68), rgba(210, 191, 156, 0.82));
   box-shadow: inset 0 0 0 1px rgba(103, 82, 47, 0.08);
+}
+
+.board-surface::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(56, 50, 42, 0.32);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms ease;
 }
 
 .board-viewport {
@@ -176,6 +259,13 @@ label {
   height: 100vh;
   overflow: auto;
   scroll-behavior: smooth;
+  cursor: grab;
+  touch-action: none;
+}
+
+.board-viewport.is-panning {
+  cursor: grabbing;
+  scroll-behavior: auto;
 }
 
 .board-canvas {
@@ -187,6 +277,11 @@ label {
   position: relative;
   transform-origin: top left;
   transition: transform 320ms ease;
+  background:
+    linear-gradient(90deg, transparent 24px, var(--board-grid) 25px, transparent 26px),
+    linear-gradient(transparent 24px, var(--board-grid) 25px, transparent 26px),
+    linear-gradient(180deg, rgba(246, 238, 219, 0.72), rgba(205, 186, 149, 0.84));
+  background-size: 80px 80px, 80px 80px, auto;
 }
 
 .brand-block,
@@ -212,6 +307,7 @@ label {
 
 .board-title-pill,
 .board-title-editor,
+.board-share-button,
 .floating-tools,
 .note-editor-panel {
   pointer-events: auto;
@@ -224,6 +320,12 @@ label {
   gap: 0.55rem;
   align-items: start;
   justify-items: center;
+}
+
+.board-title-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
 }
 
 .board-title-pill {
@@ -250,9 +352,10 @@ label {
 }
 
 .floating-tools {
-  position: absolute;
-  top: 4.4rem;
+  position: fixed;
+  top: 50%;
   right: 1rem;
+  transform: translateY(-50%);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -266,6 +369,10 @@ label {
 .board-title-input {
   font-size: 1rem;
   font-weight: 600;
+}
+
+.board-share-button {
+  margin-top: 0.2rem;
 }
 
 .link-button {
@@ -294,11 +401,13 @@ label {
 
 .note-editor-panel {
   position: absolute;
-  right: 1rem;
+  right: auto;
+  left: 1rem;
   top: 4.4rem;
   width: min(320px, calc(100vw - 2rem));
   display: grid;
   gap: 0.8rem;
+  z-index: 120;
 }
 
 .note-editor-panel.is-hidden {
@@ -371,6 +480,8 @@ label {
 }
 
 .sticky-note {
+  --note-scale: 1;
+  --note-rotation: calc((var(--tilt, 0) * 1deg));
   position: absolute;
   width: 240px;
   min-height: 240px;
@@ -381,9 +492,20 @@ label {
   box-shadow:
     0 24px 35px rgba(54, 35, 17, 0.16),
     0 6px 10px rgba(54, 35, 17, 0.08);
-  transform: rotate(calc((var(--tilt, 0) * 1deg)));
+  transform: rotate(var(--note-rotation)) scale(var(--note-scale));
+  transform-origin: top left;
   transition: box-shadow 140ms ease, transform 140ms ease;
   cursor: grab;
+}
+
+.board-layout.has-unsaved-new-note .add-note-fab,
+.board-layout.has-unsaved-new-note .trash-zone {
+  filter: grayscale(0.18) brightness(0.7);
+}
+
+.board-layout.has-unsaved-new-note .sticky-note {
+  opacity: 0.42;
+  pointer-events: none;
 }
 
 .sticky-note:nth-child(odd) {
@@ -398,7 +520,25 @@ label {
   box-shadow:
     0 26px 40px rgba(34, 26, 16, 0.26),
     0 0 0 3px rgba(28, 57, 51, 0.35);
-  transform: rotate(0deg) scale(1.01);
+}
+
+.board-layout.presentation-mode .sticky-note.selected {
+  box-shadow:
+    0 24px 35px rgba(54, 35, 17, 0.16),
+    0 6px 10px rgba(54, 35, 17, 0.08);
+}
+
+.sticky-note.is-new-note {
+  cursor: text;
+}
+
+.board-layout.has-unsaved-new-note .sticky-note.is-new-note {
+  opacity: 1;
+  pointer-events: auto;
+  z-index: 80 !important;
+  box-shadow:
+    0 34px 52px rgba(22, 18, 10, 0.32),
+    0 0 0 3px rgba(255, 255, 255, 0.7);
 }
 
 .sticky-note::before {
@@ -420,6 +560,12 @@ label {
   opacity: 0.72;
   margin-bottom: 0.6rem;
   pointer-events: auto;
+}
+
+.note-inline-actions {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
 }
 
 .note-editor,
@@ -505,9 +651,25 @@ label {
   box-shadow: none;
 }
 
+.note-cancel-button {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 8px;
+  background: rgba(60, 48, 36, 0.12);
+  color: rgba(48, 38, 28, 0.9);
+  box-shadow: none;
+}
+
 .note-save-button svg {
   width: 15px;
   height: 15px;
+}
+
+.note-cancel-button svg {
+  width: 16px;
+  height: 16px;
 }
 
 .empty-state {
@@ -522,12 +684,13 @@ label {
 .toast {
   position: fixed;
   right: 1rem;
-  bottom: 1rem;
+  bottom: 5.9rem;
   padding: 0.9rem 1.1rem;
   border-radius: 16px;
   background: rgba(28, 57, 51, 0.92);
   color: white;
   box-shadow: var(--shadow);
+  z-index: 40;
 }
 
 .toast-error {
@@ -628,8 +791,14 @@ label {
   display: none;
 }
 
-.board-layout.presentation-mode .sticky-note header {
-  display: none;
+.board-layout.presentation-mode .board-viewport {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.board-layout.presentation-mode .board-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .presentation-tip {
@@ -656,6 +825,62 @@ label {
   justify-content: space-between;
   gap: 1rem;
   align-items: center;
+}
+
+.users-panel {
+  max-width: min(620px, calc(100vw - 2rem));
+}
+
+.users-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.user-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.8rem 0.9rem;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.user-meta {
+  color: rgba(40, 49, 40, 0.72);
+  font-size: 0.92rem;
+}
+
+.user-actions {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.app-modal-overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(21, 24, 22, 0.34);
+  backdrop-filter: blur(8px);
+  z-index: 1600;
+}
+
+.app-modal {
+  width: min(420px, calc(100vw - 2rem));
+}
+
+.modal-error {
+  margin: 0;
+  color: #8b2323;
+  font-weight: 600;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
 }
 
 .qr-image {
@@ -696,9 +921,14 @@ label {
     right: 0.75rem;
     left: 0.75rem;
     bottom: 0.75rem;
+    transform: none;
     flex-direction: row;
     justify-content: space-between;
     flex-wrap: wrap;
+  }
+
+  .board-title-row {
+    width: 100%;
   }
 
   .note-editor-panel {
@@ -712,13 +942,29 @@ label {
     width: auto;
   }
 
+  .settings-grid,
+  .user-row,
+  .user-actions,
+  .modal-actions {
+    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
   .trash-zone {
     right: 0.75rem;
     bottom: 0.75rem;
+    top: auto;
   }
 
   .add-note-fab {
-    top: 0.75rem;
+    top: auto;
+    right: 5.5rem;
+    bottom: 0.75rem;
+  }
+
+  .toast {
     right: 0.75rem;
+    bottom: 5.5rem;
   }
 }

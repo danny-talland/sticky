@@ -1,0 +1,9 @@
+Statusmeldingen komen onder de trashcan, fix dit.
+Standaardgrote van bord is 25 x 25 notes. Dus ook bij een basic board.
+Startsituatie is beginnen in het midden van het bord (loopt dus door aan alle randen van het browservenster)
+Ook al is er ingezoomd bij het editten van de sticky wordt deze geanimeerd zodat het editten op "startgrote" kan gebeuren.
+Het icoon voor QR code/delen komt bovenin naar de Titel / Gebruiker. In docentmodus heeft alleen de docent die QR code.
+Wanneer ik een note edit kan ik hem slepen, zorg dat dit niet meer mogelijk is.
+Minimum bord grote is 10 x 10 notes.
+Ik kan het bord ook slepen.
+Zorg dat de icoonbalk rechts verticaal gecentreerd is.
