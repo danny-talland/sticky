@@ -10,9 +10,10 @@ const DB_USER = 'root';
 const DB_PASSWORD = '';
 const NOTE_SIZE = 240;
 const MEMBER_ACTIVE_WINDOW_SECONDS = 300;
-const DEFAULT_BOARD_COLUMNS = 20;
-const DEFAULT_BOARD_ROWS = 10;
-const MIN_BOARD_DIMENSION = 10;
+const DEFAULT_BOARD_COLUMNS = 10;
+const DEFAULT_BOARD_ROWS = 5;
+const MIN_BOARD_COLUMNS = 10;
+const MIN_BOARD_ROWS = 5;
 
 function readJsonBody(): array
 {
@@ -102,8 +103,8 @@ function normalizePin(string $pin): string
 
 function settingsFromBoardRow(array $board): array
 {
-    $maxBoardColumns = max(MIN_BOARD_DIMENSION, (int) ($board['max_board_columns'] ?? DEFAULT_BOARD_COLUMNS));
-    $maxBoardRows = max(MIN_BOARD_DIMENSION, (int) ($board['max_board_rows'] ?? DEFAULT_BOARD_ROWS));
+    $maxBoardColumns = max(MIN_BOARD_COLUMNS, (int) ($board['max_board_columns'] ?? DEFAULT_BOARD_COLUMNS));
+    $maxBoardRows = max(MIN_BOARD_ROWS, (int) ($board['max_board_rows'] ?? DEFAULT_BOARD_ROWS));
 
     return [
         'allowOnlyOwnMove' => (bool) $board['allow_only_own_move'],
@@ -416,8 +417,8 @@ function updateBoardSettings(PDO $db, int $boardId, array $settings): void
         ':allow_only_own_edit' => !empty($settings['allowOnlyOwnEdit']) ? 1 : 0,
         ':allow_viewer_create_notes' => !empty($settings['allowViewerCreateNotes']) ? 1 : 0,
         ':max_notes_per_user' => max(0, (int) ($settings['maxNotesPerUser'] ?? 0)),
-        ':max_board_columns' => max(MIN_BOARD_DIMENSION, (int) ($settings['maxBoardColumns'] ?? DEFAULT_BOARD_COLUMNS)),
-        ':max_board_rows' => max(MIN_BOARD_DIMENSION, (int) ($settings['maxBoardRows'] ?? DEFAULT_BOARD_ROWS)),
+        ':max_board_columns' => max(MIN_BOARD_COLUMNS, (int) ($settings['maxBoardColumns'] ?? DEFAULT_BOARD_COLUMNS)),
+        ':max_board_rows' => max(MIN_BOARD_ROWS, (int) ($settings['maxBoardRows'] ?? DEFAULT_BOARD_ROWS)),
         ':kick_block_minutes' => max(1, (int) ($settings['kickBlockMinutes'] ?? 15)),
         ':id' => $boardId,
     ]);
@@ -481,7 +482,7 @@ try {
                 max_notes_per_user, max_board_columns, max_board_rows, kick_block_minutes
             ) VALUES (
                 :code, :title, :created_at, :updated_at, :supervised_mode, :teacher_token_hash, :teacher_client_id,
-                0, 0, 0, 1, 0, :max_board_columns, :max_board_rows, 15
+                :allow_only_own_move, :allow_only_own_delete, :allow_only_own_edit, 1, :max_notes_per_user, :max_board_columns, :max_board_rows, 15
             )'
         );
         $stmt->execute([
@@ -492,6 +493,10 @@ try {
             ':supervised_mode' => $supervisedMode ? 1 : 0,
             ':teacher_token_hash' => $teacherToken !== null ? password_hash($teacherToken, PASSWORD_DEFAULT) : null,
             ':teacher_client_id' => $supervisedMode ? $clientId : null,
+            ':allow_only_own_move' => $supervisedMode ? 1 : 0,
+            ':allow_only_own_delete' => $supervisedMode ? 1 : 0,
+            ':allow_only_own_edit' => $supervisedMode ? 1 : 0,
+            ':max_notes_per_user' => $supervisedMode ? 10 : 0,
             ':max_board_columns' => DEFAULT_BOARD_COLUMNS,
             ':max_board_rows' => DEFAULT_BOARD_ROWS,
         ]);
