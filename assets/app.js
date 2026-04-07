@@ -1216,6 +1216,34 @@ function setZoomPreservingViewport(nextZoom) {
   render();
 }
 
+function setZoomAroundViewportPoint(nextZoom, clientX, clientY) {
+  const targetZoom = Number(nextZoom.toFixed(2));
+  if (targetZoom === state.zoom) return;
+
+  const viewport = document.querySelector(".board-viewport");
+  if (!viewport) {
+    state.zoom = targetZoom;
+    render();
+    return;
+  }
+
+  const viewportRect = viewport.getBoundingClientRect();
+  const offsetX = clientX - viewportRect.left;
+  const offsetY = clientY - viewportRect.top;
+  const logicalPointX = (viewport.scrollLeft + offsetX) / state.zoom;
+  const logicalPointY = (viewport.scrollTop + offsetY) / state.zoom;
+
+  state.zoom = targetZoom;
+  state.viewportFocus = {
+    left: Math.max(0, Math.round((logicalPointX * targetZoom) - offsetX)),
+    top: Math.max(0, Math.round((logicalPointY * targetZoom) - offsetY)),
+  };
+  state.viewportFocusDelayMs = 0;
+  state.viewportFocusBehavior = "instant";
+  state.viewportFocusSource = null;
+  render();
+}
+
 function prepareBoardForEditing(note) {
   if (!note) return;
   state.viewportFocus = buildEditorViewportFocus(note, state.zoom);
@@ -3481,6 +3509,21 @@ function renderBoard() {
 
     boardViewport.addEventListener("pointerup", endBoardPan);
     boardViewport.addEventListener("pointercancel", endBoardPan);
+
+    boardViewport.addEventListener("wheel", (event) => {
+      if (state.boardPan) return;
+      if (state.editingNoteId) return;
+      if (event.ctrlKey || event.metaKey) return;
+      if (event.target.closest(".floating-bar, .floating-tools, .note-editor-panel, .share-overlay, .users-panel, .app-modal-overlay")) return;
+      if (Math.abs(event.deltaY) < Math.abs(event.deltaX)) return;
+
+      const direction = Math.sign(event.deltaY);
+      if (!direction) return;
+
+      event.preventDefault();
+      const nextZoom = clampValue(state.zoom + (direction < 0 ? 0.1 : -0.1), 0.5, 2.5);
+      setZoomAroundViewportPoint(nextZoom, event.clientX, event.clientY);
+    }, { passive: false });
   }
 
   window.addEventListener("resize", updateEditorPanelPosition, { once: true });
@@ -3642,6 +3685,7 @@ function renderBoard() {
     if (event.target.closest(".floating-bar, .floating-tools, .note-editor-panel, .share-overlay, .users-panel, .app-modal-overlay")) return;
     if (Date.now() - state.lastBoardPanEndedAt < 120) return;
     if (state.editingNoteId) return;
+    if (state.selectedNoteId === null) return;
     state.editingNoteId = null;
     state.selectedNoteId = null;
     syncEditorPanel();
@@ -3919,10 +3963,10 @@ function renderNoteCard(note) {
   const isSettling = state.settlingNoteId === note.id;
   const isUnsavedNewNote = isLocalNoteId(note.id);
   const noteCanEdit = canEditNote(renderable);
-  const noteRotation = isUnsavedNewNote ? "0deg" : (state.presentationMode || state.selectedNoteId !== note.id ? "calc((var(--tilt, 0) * 1deg))" : "0deg");
+  const noteRotation = (isUnsavedNewNote || isEditing) ? "0deg" : "calc((var(--tilt, 0) * 1deg))";
   const noteScale = isEditing
     ? Number((editingNoteScale() * (isUnsavedNewNote ? 1.02 : 1)).toFixed(4))
-    : (!state.presentationMode && state.selectedNoteId === note.id ? 1.01 : 1);
+    : 1;
   const decorationStyle = noteDecorationStyle(renderable);
   const classes = [
     "sticky-note",

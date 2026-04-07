@@ -625,7 +625,10 @@ test.describe("board interactions", () => {
     await openSharedBoard(page, created.board.code);
     await page.waitForTimeout(300);
 
-    const before = await page.locator(".sticky-note .note-author").evaluate((element) => {
+    await page.locator(".sticky-note", { hasText: "Stable author" }).click();
+    await page.waitForSelector(".sticky-note.is-editing");
+
+    const before = await page.locator(".sticky-note.is-editing .note-author").evaluate((element) => {
       const noteRect = element.closest(".sticky-note").getBoundingClientRect();
       const rect = element.getBoundingClientRect();
       return {
@@ -634,8 +637,7 @@ test.describe("board interactions", () => {
       };
     });
 
-    await page.locator(".sticky-note", { hasText: "Stable author" }).click();
-    await page.waitForSelector(".sticky-note.is-editing");
+    await page.waitForTimeout(180);
 
     const after = await page.locator(".sticky-note.is-editing .note-author").evaluate((element) => {
       const noteRect = element.closest(".sticky-note").getBoundingClientRect();
@@ -648,6 +650,56 @@ test.describe("board interactions", () => {
 
     expect(Math.abs(after.left - before.left)).toBeLessThanOrEqual(1);
     expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
+  });
+
+  test("does not visually jump a selected sticky when clicking empty board space", async ({ page, request }) => {
+    const created = await createBoard(request);
+
+    await createSeedNote(request, {
+      code: created.board.code,
+      clientId: created.clientId,
+      x: 860,
+      y: 520,
+      content: "Stable deselect",
+      zIndex: 1,
+    });
+
+    await openSharedBoard(page, created.board.code);
+    await page.waitForTimeout(300);
+
+    await page.locator(".sticky-note", { hasText: "Stable deselect" }).click();
+    await page.waitForSelector(".sticky-note.is-editing");
+    await page.click(".sticky-note.is-editing [data-action='save-note-inline']");
+    await expect(page.locator(".sticky-note.is-editing")).toHaveCount(0);
+    await page.waitForTimeout(320);
+
+    const before = await page.locator(".sticky-note", { hasText: "Stable deselect" }).evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      };
+    });
+
+    await page.click(".board-surface", { position: { x: 48, y: 220 } });
+    await page.waitForTimeout(160);
+
+    const after = await page.locator(".sticky-note", { hasText: "Stable deselect" }).evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+      };
+    });
+
+    expect(Math.abs(after.left - before.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
+    expect(Math.abs(after.width - before.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(after.height - before.height)).toBeLessThanOrEqual(1);
   });
 
   test("applies bold italic and underline to selected note text", async ({ page, request }) => {
@@ -961,6 +1013,62 @@ test.describe("board interactions", () => {
 
     expect(Math.abs(afterZoomOut.logicalCenterX - beforeZoomOut.logicalCenterX)).toBeLessThanOrEqual(2);
     expect(Math.abs(afterZoomOut.logicalCenterY - beforeZoomOut.logicalCenterY)).toBeLessThanOrEqual(2);
+  });
+
+  test("zooms with the mouse wheel around the cursor position", async ({ page, request }) => {
+    const created = await createBoard(request);
+
+    await createSeedNote(request, { code: created.board.code, clientId: created.clientId, x: 120, y: 120, content: "North west", zIndex: 1 });
+    await createSeedNote(request, { code: created.board.code, clientId: created.clientId, x: 4200, y: 1800, content: "South east", zIndex: 2 });
+    await createSeedNote(request, { code: created.board.code, clientId: created.clientId, x: 2400, y: 960, content: "Center", zIndex: 3 });
+
+    await openSharedBoard(page, created.board.code);
+    await page.waitForTimeout(300);
+
+    const targetPoint = await page.evaluate(() => {
+      const viewport = document.querySelector(".board-viewport");
+      viewport.scrollTo({ left: 900, top: 420, behavior: "instant" });
+      const rect = viewport.getBoundingClientRect();
+      const clientX = rect.left + (rect.width * 0.62);
+      const clientY = rect.top + (rect.height * 0.38);
+      return {
+        clientX,
+        clientY,
+      };
+    });
+    await page.waitForTimeout(120);
+
+    const before = await page.evaluate(({ clientX, clientY }) => {
+      const viewport = document.querySelector(".board-viewport");
+      const rect = viewport.getBoundingClientRect();
+      const content = document.querySelector(".board-canvas-content");
+      const zoom = content.getBoundingClientRect().width / parseFloat(content.style.width);
+      return {
+        zoom,
+        logicalX: (viewport.scrollLeft + (clientX - rect.left)) / zoom,
+        logicalY: (viewport.scrollTop + (clientY - rect.top)) / zoom,
+      };
+    }, targetPoint);
+
+    await page.mouse.move(targetPoint.clientX, targetPoint.clientY);
+    await page.mouse.wheel(0, -140);
+    await page.waitForTimeout(220);
+
+    const after = await page.evaluate(({ clientX, clientY }) => {
+      const viewport = document.querySelector(".board-viewport");
+      const rect = viewport.getBoundingClientRect();
+      const content = document.querySelector(".board-canvas-content");
+      const zoom = content.getBoundingClientRect().width / parseFloat(content.style.width);
+      return {
+        zoom,
+        logicalX: (viewport.scrollLeft + (clientX - rect.left)) / zoom,
+        logicalY: (viewport.scrollTop + (clientY - rect.top)) / zoom,
+      };
+    }, targetPoint);
+
+    expect(after.zoom).toBeGreaterThan(before.zoom);
+    expect(Math.abs(after.logicalX - before.logicalX)).toBeLessThanOrEqual(2);
+    expect(Math.abs(after.logicalY - before.logicalY)).toBeLessThanOrEqual(2);
   });
 
   test("keeps fit-view stable while a new note is edited and returns the note to board scale after save", async ({ page, request }) => {
