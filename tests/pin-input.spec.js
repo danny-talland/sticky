@@ -1,12 +1,12 @@
 const { test, expect } = require("@playwright/test");
 
-async function createBoard(request, supervisedMode) {
+async function createBoard(request, managementMode) {
   const clientId = `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const response = await request.post("./api.php?action=create_board", {
     data: {
-      title: `PW ${supervisedMode ? "Supervised" : "Open"} Board`,
-      supervisedMode,
-      teacherName: "Playwright",
+      title: `PW ${managementMode ? "Managed" : "Open"} Board`,
+      managementMode,
+      adminName: "Playwright",
       clientId,
     },
   });
@@ -142,15 +142,18 @@ test.describe("existing board access", () => {
     await expect(page.locator('[data-form="new-board-modal"]')).toHaveCount(0);
   });
 
-  test("creates supervised boards with the expected default limits and ownership rules", async ({ request }) => {
+  test("creates management boards with the expected default limits and ownership rules", async ({ request }) => {
     const created = await createBoard(request, true);
 
     expect(created.board.settings.allowOnlyOwnMove).toBe(true);
     expect(created.board.settings.allowOnlyOwnDelete).toBe(true);
     expect(created.board.settings.allowOnlyOwnEdit).toBe(true);
+    expect(created.board.settings.likesEnabled).toBe(true);
     expect(created.board.settings.maxNotesPerUser).toBe(10);
     expect(created.board.settings.maxBoardColumns).toBe(10);
     expect(created.board.settings.maxBoardRows).toBe(5);
+    expect(created.board.settings.lineColumns).toBe(0);
+    expect(created.board.settings.lineRows).toBe(0);
   });
 
   test("asks for a user name when opening a shared board link and reuses the stored suggestion", async ({ page, request }) => {
@@ -175,15 +178,15 @@ test.describe("existing board access", () => {
     expect(storedName).toBe("Alice");
   });
 
-  test("shows the admin login icon only for supervised boards and allows PIN login", async ({ page, request }) => {
+  test("shows the admin login icon only for management boards and allows PIN login", async ({ page, request }) => {
     const created = await createBoard(request, true);
     const code = created.board.code;
 
-    const pinResponse = await request.post("./api.php?action=set_teacher_pin", {
+    const pinResponse = await request.post("./api.php?action=set_admin_pin", {
       data: {
         code,
         pin: "9876",
-        teacherToken: created.teacherToken,
+        adminToken: created.adminToken,
       },
     });
     expect(pinResponse.ok()).toBeTruthy();
@@ -191,12 +194,12 @@ test.describe("existing board access", () => {
     await page.goto("./", { waitUntil: "domcontentloaded" });
     await fillJoinCode(page, code);
 
-    const adminButton = page.locator('[data-form="join-board"] [data-action="open-teacher-login"]');
+    const adminButton = page.locator('[data-form="join-board"] [data-action="open-admin-login"]');
     await expect(adminButton).toBeVisible();
 
     await adminButton.click();
 
-    const pinInputs = page.locator('[data-pin-digit="teacher-login-modal"]');
+    const pinInputs = page.locator('[data-pin-digit="admin-login-modal"]');
     await expect(pinInputs).toHaveCount(4);
 
     await pinInputs.nth(0).fill("9");
@@ -221,19 +224,19 @@ test.describe("existing board access", () => {
     await expect(pinInputs.nth(2)).toHaveValue("*");
     await expect(pinInputs.nth(3)).toHaveValue("*");
 
-    await page.locator('[data-action="submit-teacher-login"]').click();
+    await page.locator('[data-action="submit-admin-login"]').click();
     await expect(page.locator('[data-action="open-settings"]')).toBeVisible();
   });
 
-  test("allows a regular user on a supervised board to promote to teacher from the board toolbar", async ({ page, request }) => {
+  test("allows a regular user on a management board to promote to admin from the board toolbar", async ({ page, request }) => {
     const created = await createBoard(request, true);
     const code = created.board.code;
 
-    const pinResponse = await request.post("./api.php?action=set_teacher_pin", {
+    const pinResponse = await request.post("./api.php?action=set_admin_pin", {
       data: {
         code,
         pin: "9876",
-        teacherToken: created.teacherToken,
+        adminToken: created.adminToken,
       },
     });
     expect(pinResponse.ok()).toBeTruthy();
@@ -244,10 +247,10 @@ test.describe("existing board access", () => {
     await page.locator('[data-form="join-board"] button[type="submit"]').click();
 
     await expect(page.locator(".board-viewport")).toBeVisible();
-    await expect(page.locator('[data-action="open-board-teacher-login"]')).toBeVisible();
+    await expect(page.locator('[data-action="open-board-admin-login"]')).toBeVisible();
 
-    await page.locator('[data-action="open-board-teacher-login"]').click();
-    const pinInputs = page.locator('[data-pin-digit="teacher-login-modal"]');
+    await page.locator('[data-action="open-board-admin-login"]').click();
+    const pinInputs = page.locator('[data-pin-digit="admin-login-modal"]');
     await expect(pinInputs).toHaveCount(4);
 
     await pinInputs.nth(0).pressSequentially("9876");
@@ -256,9 +259,9 @@ test.describe("existing board access", () => {
     await expect(pinInputs.nth(2)).toHaveValue("*");
     await expect(pinInputs.nth(3)).toHaveValue("*");
 
-    await page.locator('[data-action="submit-teacher-login"]').click();
+    await page.locator('[data-action="submit-admin-login"]').click();
     await expect(page.locator('[data-action="open-settings"]')).toBeVisible();
-    await expect(page.locator('[data-action="open-board-teacher-login"]')).toHaveCount(0);
+    await expect(page.locator('[data-action="open-board-admin-login"]')).toHaveCount(0);
   });
 
   test("does not show the admin login icon for normal boards", async ({ page, request }) => {
@@ -267,6 +270,43 @@ test.describe("existing board access", () => {
     await page.goto("./", { waitUntil: "domcontentloaded" });
     await fillJoinCode(page, created.board.code);
 
-    await expect(page.locator('[data-form="join-board"] [data-action="open-teacher-login"]')).toBeHidden();
+    await expect(page.locator('[data-form="join-board"] [data-action="open-admin-login"]')).toBeHidden();
+  });
+
+  test("exports board notes as txt and csv", async ({ request }) => {
+    const created = await createBoard(request, false);
+
+    const noteResponse = await request.post("./api.php?action=create_note", {
+      data: {
+        code: created.board.code,
+        clientId: "pw-export-user",
+        author: "Exporter",
+        content: "<b>Hello export</b>",
+        color: "yellow",
+        fontFamily: "comic",
+        fontSize: 22,
+        isBold: false,
+        isItalic: false,
+        isUnderline: false,
+        x: 120,
+        y: 120,
+        zIndex: 1,
+      },
+    });
+    expect(noteResponse.ok()).toBeTruthy();
+
+    const txtResponse = await request.get(`./api.php?action=export_board&code=${created.board.code}&format=txt`);
+    expect(txtResponse.ok()).toBeTruthy();
+    expect(txtResponse.headers()["content-type"]).toContain("text/plain");
+    const txtBody = await txtResponse.text();
+    expect(txtBody).toContain("Exporter");
+    expect(txtBody).toContain("Hello export");
+
+    const csvResponse = await request.get(`./api.php?action=export_board&code=${created.board.code}&format=csv`);
+    expect(csvResponse.ok()).toBeTruthy();
+    expect(csvResponse.headers()["content-type"]).toContain("text/csv");
+    const csvBody = await csvResponse.text();
+    expect(csvBody).toContain("author,content,likes,color,x,y,updatedAt");
+    expect(csvBody).toContain("Exporter");
   });
 });

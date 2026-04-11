@@ -50,6 +50,12 @@ const languageAliases = {
 const colorOptions = ["yellow", "pink", "blue", "green", "peach", "lilac"];
 const fontOptions = ["comic", "marker", "clean", "typewriter"];
 const NOTE_SIZE = 240;
+const LABEL_MAX_WIDTH = 260;
+const LABEL_HEIGHT = 84;
+const DEFAULT_LABEL_FONT_SIZE = 26;
+const MIN_LABEL_FONT_SIZE = 22;
+const MAX_LABEL_FONT_SIZE = 42;
+const LABEL_FONT_SIZE_STEP = 4;
 const MIN_NOTE_FONT_SIZE = 14;
 const MAX_NOTE_FONT_SIZE = 42;
 const NOTE_FONT_SIZE_PRESETS = [14, 18, 22, 26, 34, 42];
@@ -68,15 +74,18 @@ const state = {
   view: "home",
   lang: "en",
   translations: {},
+  fallbackTranslations: {},
   clientId: "",
-  teacherToken: null,
+  adminToken: null,
   board: null,
   notes: [],
+  labels: [],
   members: [],
   drafts: {},
   settingsDraft: null,
   userName: "",
   selectedNoteId: null,
+  selectedLabelId: null,
   editingNoteId: null,
   qrModalOpen: false,
   usersPanelOpen: false,
@@ -107,14 +116,17 @@ const state = {
   settlingNoteTimer: null,
   savedEditorSelection: null,
   editorInlineFontSizePreview: null,
+  mobileEditorToolsOpen: false,
   presentationLayoutSnapshot: null,
   presentationLayoutCleanupTimer: null,
   presentationMovedNoteIds: [],
   presentationEnteringNoteIds: [],
   presentationBoardVisualSource: null,
+  zoomIndicatorTimer: null,
   viewportAnimationFrame: null,
   drag: null,
   saveTimers: new Map(),
+  pendingLabelSaveIds: new Set(),
   nextLocalNoteId: -1,
 };
 
@@ -183,8 +195,9 @@ async function loadTranslations(lang) {
 
 function t(key, replacements = {}) {
   const dict = state.translations || {};
+  const fallbackDict = state.fallbackTranslations || {};
   const fallback = key;
-  let value = dict[key] ?? fallback;
+  let value = dict[key] ?? fallbackDict[key] ?? fallback;
 
   Object.entries(replacements).forEach(([placeholder, replacement]) => {
     value = value.replace(`{${placeholder}}`, String(replacement));
@@ -202,6 +215,10 @@ async function setLanguage(lang) {
     state.lang = "en";
     state.translations = await loadTranslations("en");
   }
+
+  state.fallbackTranslations = state.lang === "en"
+    ? state.translations
+    : await loadTranslations("en").catch(() => ({}));
 
   persistLanguage(state.lang);
   applyDocumentLanguage(state.lang);
@@ -226,22 +243,33 @@ function ensureClientId() {
   window.localStorage.setItem("sticky.clientId", state.clientId);
 }
 
-function teacherTokenStorageKey(boardCode) {
-  return `sticky.teacherToken.${boardCode}`;
+function adminTokenStorageKey(boardCode) {
+  return `sticky.adminToken.${boardCode}`;
 }
 
-function persistTeacherToken(boardCode, token) {
-  state.teacherToken = token;
+function persistAdminToken(boardCode, token) {
+  state.adminToken = token;
   if (!boardCode) return;
   if (token) {
-    window.localStorage.setItem(teacherTokenStorageKey(boardCode), token);
+    window.localStorage.setItem(adminTokenStorageKey(boardCode), token);
+    window.localStorage.removeItem(`sticky.teacherToken.${boardCode}`);
   } else {
-    window.localStorage.removeItem(teacherTokenStorageKey(boardCode));
+    window.localStorage.removeItem(adminTokenStorageKey(boardCode));
+    window.localStorage.removeItem(`sticky.teacherToken.${boardCode}`);
   }
 }
 
-function loadTeacherToken(boardCode) {
-  state.teacherToken = boardCode ? window.localStorage.getItem(teacherTokenStorageKey(boardCode)) : null;
+function loadAdminToken(boardCode) {
+  if (!boardCode) {
+    state.adminToken = null;
+    return;
+  }
+  state.adminToken = window.localStorage.getItem(adminTokenStorageKey(boardCode))
+    || window.localStorage.getItem(`sticky.teacherToken.${boardCode}`);
+}
+
+function adminTokenFromPayload(payload) {
+  return payload?.adminToken || payload?.teacherToken || null;
 }
 
 async function api(action, options = {}) {
@@ -270,8 +298,8 @@ async function fetchBoardByCode(code) {
     clientId: state.clientId,
     userName: state.userName,
   });
-  if (state.teacherToken) {
-    params.set("teacherToken", state.teacherToken);
+  if (state.adminToken) {
+    params.set("adminToken", state.adminToken);
   }
 
   const response = await fetch(`./api.php?${params.toString()}`);
@@ -329,12 +357,28 @@ function boardCodeFromUrl() {
   return (url.searchParams.get("board") || "").toUpperCase();
 }
 
-function isTeacher() {
-  return Boolean(state.board?.supervisedMode && state.teacherToken && state.board?.isTeacher);
+function isManagementBoard(board = state.board) {
+  return Boolean(board?.managementMode ?? board?.supervisedMode);
 }
 
-function canOpenTeacherLoginOnBoard() {
-  return Boolean(state.board?.supervisedMode && !isTeacher());
+function boardHasAdminAccess(board = state.board) {
+  return Boolean(board?.isAdmin ?? board?.isTeacher);
+}
+
+function memberHasAdminAccess(member) {
+  return Boolean(member?.isAdmin ?? member?.isTeacher);
+}
+
+function isAdminLoginAvailable(access) {
+  return Boolean(access?.adminLoginAvailable ?? access?.teacherLoginAvailable);
+}
+
+function isAdmin() {
+  return Boolean(isManagementBoard(state.board) && state.adminToken && boardHasAdminAccess(state.board));
+}
+
+function canOpenAdminLoginOnBoard() {
+  return Boolean(isManagementBoard(state.board) && !isAdmin());
 }
 
 function boardSettings() {
@@ -343,9 +387,12 @@ function boardSettings() {
     allowOnlyOwnDelete: true,
     allowOnlyOwnEdit: true,
     allowViewerCreateNotes: true,
+    likesEnabled: true,
     maxNotesPerUser: 10,
     maxBoardColumns: DEFAULT_BOARD_COLUMNS,
     maxBoardRows: DEFAULT_BOARD_ROWS,
+    lineColumns: 0,
+    lineRows: 0,
     kickBlockMinutes: 15,
   };
 }
@@ -356,6 +403,24 @@ function normalizedBoardColumns() {
 
 function normalizedBoardRows() {
   return Math.max(MIN_BOARD_ROWS, Number(boardSettings().maxBoardRows) || DEFAULT_BOARD_ROWS);
+}
+
+function normalizedGuideCount(value) {
+  const numericValue = Math.round(Number(value) || 0);
+  if (numericValue <= 0) return 0;
+  return Math.max(2, numericValue);
+}
+
+function displayGuideCountValue(value) {
+  const numericValue = Math.round(Number(value) || 0);
+  if (numericValue <= 0) return 0;
+  return normalizedGuideCount(numericValue);
+}
+
+function normalizeGuideCountInput(input) {
+  if (!input || input.value === "") return;
+  const numericValue = Math.max(0, Math.round(Number(input.value) || 0));
+  input.value = String(numericValue === 1 ? 2 : numericValue);
 }
 
 function normalizePinValue(value) {
@@ -628,10 +693,10 @@ function clearHomeJoinLookupTimer() {
 function setHomeJoinBoardAccess(access) {
   state.homeJoinBoardAccess = access;
 
-  const teacherLoginButton = app.querySelector('[data-action="open-teacher-login"]');
-  if (!teacherLoginButton) return;
+  const adminLoginButton = app.querySelector('[data-action="open-admin-login"]');
+  if (!adminLoginButton) return;
 
-  teacherLoginButton.style.display = access?.teacherLoginAvailable ? "inline-flex" : "none";
+  adminLoginButton.style.display = isAdminLoginAvailable(access) ? "inline-flex" : "none";
 }
 
 function scheduleHomeJoinAccessLookup(code) {
@@ -891,31 +956,65 @@ function noteBelongsToCurrentUser(note) {
   return Boolean(note?.ownerClientId && note.ownerClientId === state.clientId);
 }
 
+function labelBelongsToCurrentUser(label) {
+  return Boolean(label?.ownerClientId && label.ownerClientId === state.clientId);
+}
+
 function canCreateNotes() {
-  if (!state.board?.supervisedMode) return true;
-  if (isTeacher()) return true;
+  if (!isManagementBoard(state.board)) return true;
+  if (isAdmin()) return true;
   return boardSettings().allowViewerCreateNotes;
 }
 
+function canManageLabels() {
+  if (!isManagementBoard(state.board)) return true;
+  return isAdmin();
+}
+
+function likesEnabled() {
+  return Boolean(boardSettings().likesEnabled);
+}
+
 function canMoveNote(note) {
-  if (!state.board?.supervisedMode) return true;
-  if (isTeacher()) return true;
+  if (!isManagementBoard(state.board)) return true;
+  if (isAdmin()) return true;
   if (!boardSettings().allowOnlyOwnMove) return true;
   return noteBelongsToCurrentUser(note);
 }
 
 function canEditNote(note) {
-  if (!state.board?.supervisedMode) return true;
-  if (isTeacher()) return true;
+  if (!isManagementBoard(state.board)) return true;
+  if (isAdmin()) return true;
   if (!boardSettings().allowOnlyOwnEdit) return true;
   return noteBelongsToCurrentUser(note);
 }
 
 function canDeleteNote(note) {
-  if (!state.board?.supervisedMode) return true;
-  if (isTeacher()) return true;
+  if (!isManagementBoard(state.board)) return true;
+  if (isAdmin()) return true;
   if (!boardSettings().allowOnlyOwnDelete) return true;
   return noteBelongsToCurrentUser(note);
+}
+
+function canMoveLabel(label) {
+  if (!canManageLabels()) return false;
+  if (!isManagementBoard(state.board)) return true;
+  if (!boardSettings().allowOnlyOwnMove) return true;
+  return labelBelongsToCurrentUser(label);
+}
+
+function canEditLabel(label) {
+  if (!canManageLabels()) return false;
+  if (!isManagementBoard(state.board)) return true;
+  if (!boardSettings().allowOnlyOwnEdit) return true;
+  return labelBelongsToCurrentUser(label);
+}
+
+function canDeleteLabel(label) {
+  if (!canManageLabels()) return false;
+  if (!isManagementBoard(state.board)) return true;
+  if (!boardSettings().allowOnlyOwnDelete) return true;
+  return labelBelongsToCurrentUser(label);
 }
 
 function notesOwnedByCurrentUser() {
@@ -926,6 +1025,18 @@ function clampValue(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function normalizedLabelFontSize(value) {
+  return clampValue(Math.round(Number(value) || DEFAULT_LABEL_FONT_SIZE), MIN_LABEL_FONT_SIZE, MAX_LABEL_FONT_SIZE);
+}
+
+function labelMetrics(label) {
+  const fontSize = normalizedLabelFontSize(label?.fontSize);
+  return {
+    width: LABEL_MAX_WIDTH,
+    height: Math.max(LABEL_HEIGHT, Math.round(fontSize * 2.9)),
+  };
+}
+
 function clampNotePosition(x, y, noteWidth = NOTE_SIZE, noteHeight = NOTE_SIZE) {
   const maxX = Math.max(0, normalizedBoardColumns() * NOTE_SIZE - noteWidth);
   const maxY = Math.max(0, normalizedBoardRows() * NOTE_SIZE - noteHeight);
@@ -933,6 +1044,22 @@ function clampNotePosition(x, y, noteWidth = NOTE_SIZE, noteHeight = NOTE_SIZE) 
     x: clampValue(x, 0, maxX),
     y: clampValue(y, 0, maxY),
   };
+}
+
+function clampLabelPosition(x, y, labelWidth = LABEL_MAX_WIDTH, labelHeight = LABEL_HEIGHT) {
+  const maxX = Math.max(0, normalizedBoardColumns() * NOTE_SIZE - labelWidth);
+  const maxY = Math.max(0, normalizedBoardRows() * NOTE_SIZE - labelHeight);
+  return {
+    x: clampValue(x, 0, maxX),
+    y: clampValue(y, 0, maxY),
+  };
+}
+
+function normalizeLabelText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
 }
 
 function editingNoteScale(zoom = state.zoom) {
@@ -984,7 +1111,7 @@ function saveNoteDebounced(note) {
       const payload = {
         ...serializeNote(note),
         clientId: state.clientId,
-        teacherToken: state.teacherToken,
+        adminToken: state.adminToken,
       };
       const data = await api("update_note", { method: "POST", body: payload });
       upsertNote(data.note);
@@ -1017,6 +1144,18 @@ function serializeNote(note) {
   };
 }
 
+function serializeLabel(label) {
+  return {
+    id: label.id,
+    author: label.author,
+    text: label.text,
+    fontSize: normalizedLabelFontSize(label.fontSize),
+    x: label.x,
+    y: label.y,
+    zIndex: label.zIndex,
+  };
+}
+
 function upsertNote(note) {
   const index = state.notes.findIndex((entry) => entry.id === note.id);
   if (index >= 0) {
@@ -1028,6 +1167,17 @@ function upsertNote(note) {
   state.notes.sort((a, b) => a.zIndex - b.zIndex || a.id - b.id);
 }
 
+function upsertLabel(label) {
+  const index = state.labels.findIndex((entry) => entry.id === label.id);
+  if (index >= 0) {
+    state.labels[index] = label;
+  } else {
+    state.labels.push(label);
+  }
+
+  state.labels.sort((a, b) => a.zIndex - b.zIndex || a.id - b.id);
+}
+
 function selectedNote() {
   return getRenderableNote(state.selectedNoteId);
 }
@@ -1036,22 +1186,33 @@ function editingNote() {
   return getRenderableNote(state.editingNoteId);
 }
 
-function comparableBoardState({ board, notes, members }) {
+function getLabelById(labelId) {
+  return state.labels.find((entry) => entry.id === labelId) || null;
+}
+
+function selectedLabel() {
+  return getLabelById(state.selectedLabelId);
+}
+
+function comparableBoardState({ board, notes, labels, members }) {
   return {
     board: board ? {
       id: board.id,
       code: board.code,
       title: board.title,
-      supervisedMode: Boolean(board.supervisedMode),
-      isTeacher: Boolean(board.isTeacher),
+      managementMode: isManagementBoard(board),
+      isAdmin: boardHasAdminAccess(board),
       settings: board.settings ? {
         allowOnlyOwnMove: Boolean(board.settings.allowOnlyOwnMove),
         allowOnlyOwnDelete: Boolean(board.settings.allowOnlyOwnDelete),
         allowOnlyOwnEdit: Boolean(board.settings.allowOnlyOwnEdit),
         allowViewerCreateNotes: Boolean(board.settings.allowViewerCreateNotes),
+        likesEnabled: Boolean(board.settings.likesEnabled),
         maxNotesPerUser: Number(board.settings.maxNotesPerUser) || 0,
         maxBoardColumns: Number(board.settings.maxBoardColumns) || DEFAULT_BOARD_COLUMNS,
         maxBoardRows: Number(board.settings.maxBoardRows) || DEFAULT_BOARD_ROWS,
+        lineColumns: Number(board.settings.lineColumns) || 0,
+        lineRows: Number(board.settings.lineRows) || 0,
         kickBlockMinutes: Number(board.settings.kickBlockMinutes) || 15,
       } : null,
     } : null,
@@ -1068,17 +1229,32 @@ function comparableBoardState({ board, notes, members }) {
         isBold: Boolean(note.isBold),
         isItalic: Boolean(note.isItalic),
         isUnderline: Boolean(note.isUnderline),
+        likesCount: Number(note.likesCount) || 0,
+        isLikedByCurrentUser: Boolean(note.isLikedByCurrentUser),
         x: note.x,
         y: note.y,
         zIndex: note.zIndex,
         updatedAt: note.updatedAt,
       }))
       .sort((a, b) => a.id - b.id),
+    labels: (labels || [])
+      .map((label) => ({
+        id: label.id,
+        ownerClientId: label.ownerClientId,
+        author: label.author,
+        text: label.text,
+        fontSize: normalizedLabelFontSize(label.fontSize),
+        x: label.x,
+        y: label.y,
+        zIndex: label.zIndex,
+        updatedAt: label.updatedAt,
+      }))
+      .sort((a, b) => a.id - b.id),
     members: (members || [])
       .map((member) => ({
         clientId: member.clientId,
         userName: member.userName,
-        isTeacher: Boolean(member.isTeacher),
+        isAdmin: memberHasAdminAccess(member),
         noteCount: Number(member.noteCount) || 0,
       }))
       .sort((a, b) => a.clientId.localeCompare(b.clientId)),
@@ -1090,8 +1266,8 @@ function protectedRemoteNoteIds() {
   state.saveTimers.forEach((_entry, noteId) => {
     protectedIds.add(Number(noteId));
   });
-  if (state.drag?.noteId !== undefined && state.drag?.noteId !== null) {
-    protectedIds.add(state.drag.noteId);
+  if (state.drag?.type === "note" && state.drag?.id !== undefined && state.drag?.id !== null) {
+    protectedIds.add(state.drag.id);
   }
   Object.keys(state.drafts).forEach((noteId) => {
     const numericNoteId = Number(noteId);
@@ -1099,6 +1275,14 @@ function protectedRemoteNoteIds() {
       protectedIds.add(numericNoteId);
     }
   });
+  return protectedIds;
+}
+
+function protectedRemoteLabelIds() {
+  const protectedIds = new Set(state.pendingLabelSaveIds);
+  if (state.drag?.type === "label" && state.drag?.id !== undefined && state.drag?.id !== null) {
+    protectedIds.add(state.drag.id);
+  }
   return protectedIds;
 }
 
@@ -1113,6 +1297,16 @@ function mergeRemoteNotesWithLocalState(remoteNotes) {
   const localTransientNotes = state.notes.filter((note) => isLocalNoteId(note.id));
   return [...mergedNotes, ...localTransientNotes]
     .sort((a, b) => a.zIndex - b.zIndex || a.id - b.id);
+}
+
+function mergeRemoteLabelsWithLocalState(remoteLabels) {
+  const localLabelsById = new Map(state.labels.map((label) => [label.id, label]));
+  const protectedIds = protectedRemoteLabelIds();
+  return (remoteLabels || []).map((remoteLabel) => (
+    protectedIds.has(remoteLabel.id) && localLabelsById.has(remoteLabel.id)
+      ? localLabelsById.get(remoteLabel.id)
+      : remoteLabel
+  )).sort((a, b) => a.zIndex - b.zIndex || a.id - b.id);
 }
 
 function computePresentationNoteTransitions(previousNotes, nextNotes) {
@@ -1145,9 +1339,95 @@ function boardStateSignature(snapshot) {
 function getBoardViewportSize() {
   const viewport = document.querySelector(".board-viewport");
   return {
-    width: viewport?.clientWidth || window.innerWidth || 1200,
-    height: viewport?.clientHeight || window.innerHeight || 700,
+    width: viewport?.clientWidth || window.visualViewport?.width || window.innerWidth || 1200,
+    height: viewport?.clientHeight || window.visualViewport?.height || window.innerHeight || 700,
   };
+}
+
+function roundZoomValue(zoom) {
+  return Number(Number(zoom).toFixed(2));
+}
+
+function computeBoardViewportLayout(targetZoom, viewportWidth, viewportHeight) {
+  const metrics = getCanvasMetrics();
+  const resolvedViewportWidth = viewportWidth || window.visualViewport?.width || window.innerWidth || 1200;
+  const resolvedViewportHeight = viewportHeight || window.visualViewport?.height || window.innerHeight || 700;
+  const canvasWidth = Math.round(metrics.width * targetZoom);
+  const canvasHeight = Math.round(metrics.height * targetZoom);
+  const viewportContentWidth = Math.max(resolvedViewportWidth, canvasWidth);
+  const viewportContentHeight = Math.max(resolvedViewportHeight, canvasHeight);
+  const canvasOffsetX = Math.max(0, Math.round((viewportContentWidth - canvasWidth) / 2));
+  const canvasOffsetY = Math.max(0, Math.round((viewportContentHeight - canvasHeight) / 2));
+
+  return {
+    metrics,
+    canvasWidth,
+    canvasHeight,
+    viewportContentWidth,
+    viewportContentHeight,
+    canvasOffsetX,
+    canvasOffsetY,
+  };
+}
+
+function applyBoardViewportVisualLayout({
+  zoom,
+  scrollLeft,
+  scrollTop,
+  viewport = document.querySelector(".board-viewport"),
+  viewportContent = document.querySelector(".board-viewport-content"),
+  canvas = document.querySelector(".board-canvas"),
+  content = document.querySelector(".board-canvas-content"),
+} = {}) {
+  if (!viewport || !viewportContent || !canvas || !content) return null;
+
+  const layout = computeBoardViewportLayout(zoom, viewport.clientWidth, viewport.clientHeight);
+  viewportContent.style.width = `${layout.viewportContentWidth}px`;
+  viewportContent.style.height = `${layout.viewportContentHeight}px`;
+  canvas.style.left = `${layout.canvasOffsetX}px`;
+  canvas.style.top = `${layout.canvasOffsetY}px`;
+  canvas.style.width = `${layout.canvasWidth}px`;
+  canvas.style.height = `${layout.canvasHeight}px`;
+  content.style.width = `${layout.metrics.width}px`;
+  content.style.height = `${layout.metrics.height}px`;
+  content.style.transform = `scale(${zoom})`;
+
+  const nextScrollLeft = clampValue(
+    Math.round(scrollLeft || 0),
+    0,
+    Math.max(0, layout.viewportContentWidth - viewport.clientWidth)
+  );
+  const nextScrollTop = clampValue(
+    Math.round(scrollTop || 0),
+    0,
+    Math.max(0, layout.viewportContentHeight - viewport.clientHeight)
+  );
+
+  viewport.scrollLeft = nextScrollLeft;
+  viewport.scrollTop = nextScrollTop;
+
+  return {
+    zoom,
+    scrollLeft: nextScrollLeft,
+    scrollTop: nextScrollTop,
+    layout,
+  };
+}
+
+function isCompactViewport() {
+  return window.matchMedia("(max-width: 980px)").matches;
+}
+
+function dragIntentThreshold(pointerType = "") {
+  return pointerType === "touch" || isCompactViewport() ? 10 : 2;
+}
+
+function updateViewportEnvironment() {
+  const visualViewport = window.visualViewport;
+  const keyboardOffset = visualViewport
+    ? Math.max(0, Math.round(window.innerHeight - visualViewport.height - visualViewport.offsetTop))
+    : 0;
+  document.documentElement.style.setProperty("--mobile-keyboard-offset", `${keyboardOffset}px`);
 }
 
 function showToast(message, isError = false) {
@@ -1192,7 +1472,7 @@ function centerBoardInView() {
 }
 
 function setZoomPreservingViewport(nextZoom) {
-  const targetZoom = Number(nextZoom.toFixed(2));
+  const targetZoom = roundZoomValue(nextZoom);
   if (targetZoom === state.zoom) return;
 
   const viewport = document.querySelector(".board-viewport");
@@ -1217,7 +1497,7 @@ function setZoomPreservingViewport(nextZoom) {
 }
 
 function setZoomAroundViewportPoint(nextZoom, clientX, clientY) {
-  const targetZoom = Number(nextZoom.toFixed(2));
+  const targetZoom = roundZoomValue(nextZoom);
   if (targetZoom === state.zoom) return;
 
   const viewport = document.querySelector(".board-viewport");
@@ -1321,6 +1601,27 @@ function showActionTooltip(target, message) {
   window.clearTimeout(target._stickyTooltipTimeout);
   target._stickyTooltipTimeout = window.setTimeout(() => {
     target._stickyTooltipInstance?.hide();
+  }, 1100);
+}
+
+function showZoomIndicator(message) {
+  const app = document.getElementById("app");
+  if (!app || state.view !== "board" || !message) return;
+
+  let indicator = app.querySelector(".zoom-indicator");
+  if (!indicator) {
+    indicator = document.createElement("div");
+    indicator.className = "zoom-indicator";
+    indicator.setAttribute("role", "status");
+    indicator.setAttribute("aria-live", "polite");
+    app.append(indicator);
+  }
+
+  indicator.textContent = message;
+  indicator.classList.add("is-visible");
+  window.clearTimeout(state.zoomIndicatorTimer);
+  state.zoomIndicatorTimer = window.setTimeout(() => {
+    indicator.classList.remove("is-visible");
   }, 1100);
 }
 
@@ -1733,6 +2034,7 @@ function exitNoteEditing(noteId = state.editingNoteId) {
   if (state.editorInlineFontSizePreview?.noteId === noteId) {
     state.editorInlineFontSizePreview = null;
   }
+  state.mobileEditorToolsOpen = false;
   state.pendingEditorFocusNoteId = null;
   startSettlingNote(noteId);
   render();
@@ -1754,6 +2056,7 @@ function cancelNote(noteId) {
     if (state.editorInlineFontSizePreview?.noteId === noteId) {
       state.editorInlineFontSizePreview = null;
     }
+    state.mobileEditorToolsOpen = false;
     render();
     return;
   }
@@ -1774,6 +2077,7 @@ function cancelNote(noteId) {
   if (state.editorInlineFontSizePreview?.noteId === noteId) {
     state.editorInlineFontSizePreview = null;
   }
+  state.mobileEditorToolsOpen = false;
 
   render();
 }
@@ -1798,7 +2102,7 @@ async function saveNoteNow(noteId = state.selectedNoteId) {
     ...serializeNote(note),
     code: state.board?.code,
     clientId: state.clientId,
-    teacherToken: state.teacherToken,
+    adminToken: state.adminToken,
     content: sanitizeRichText(note.content || ""),
   };
   const action = isLocalNoteId(note.id) ? "create_note" : "update_note";
@@ -1823,6 +2127,7 @@ async function saveNoteNow(noteId = state.selectedNoteId) {
   if (state.editorInlineFontSizePreview?.noteId === noteId) {
     state.editorInlineFontSizePreview = null;
   }
+  state.mobileEditorToolsOpen = false;
   startSettlingNote(data.note.id);
   showToast(t("saved"));
   render();
@@ -1851,7 +2156,7 @@ async function deleteNote(noteId) {
     body: {
       id: noteId,
       clientId: state.clientId,
-      teacherToken: state.teacherToken,
+      adminToken: state.adminToken,
     },
   });
 
@@ -1872,22 +2177,196 @@ async function deleteNote(noteId) {
   render();
 }
 
-async function saveSupervisedSettings(openBoardAfterSave = false) {
-  if (!state.board || !isTeacher() || !state.settingsDraft) return;
+async function toggleNoteLike(noteId) {
+  const note = getNoteById(noteId);
+  if (!note || !state.board || !likesEnabled()) return;
+
+  const data = await api("toggle_note_like", {
+    method: "POST",
+    body: {
+      id: noteId,
+      clientId: state.clientId,
+      userName: state.userName,
+      adminToken: state.adminToken,
+      liked: !note.isLikedByCurrentUser,
+    },
+  });
+
+  upsertNote(data.note);
+  render();
+}
+
+function currentViewportBoardPosition(itemWidth = LABEL_MAX_WIDTH, itemHeight = LABEL_HEIGHT) {
+  const boardViewport = document.querySelector(".board-viewport");
+  const { width: viewportWidth, height: viewportHeight } = getBoardViewportSize();
+  const viewportLeft = boardViewport ? boardViewport.scrollLeft / state.zoom : 0;
+  const viewportTop = boardViewport ? boardViewport.scrollTop / state.zoom : 0;
+
+  return clampLabelPosition(
+    Math.max(24, Math.round(viewportLeft + (((viewportWidth / state.zoom) - itemWidth) * 0.5))),
+    Math.max(24, Math.round(viewportTop + (((viewportHeight / state.zoom) - itemHeight) * 0.5))),
+    itemWidth,
+    itemHeight
+  );
+}
+
+function bringLabelToFront(labelId) {
+  const label = getLabelById(labelId);
+  if (!label) return;
+  const highestZ = state.labels.reduce((max, entry) => Math.max(max, entry.zIndex), 0) + 1;
+  label.zIndex = highestZ;
+}
+
+async function createLabel(text) {
+  if (!state.board) return;
+  if (!canManageLabels()) {
+    showToast(state.lang === "nl" ? "Alleen beheerders kunnen labels toevoegen." : "Only admins can add labels.", true);
+    return;
+  }
+  if (!canCreateNotes()) {
+    showToast(t("users_cannot_add_notes"), true);
+    return;
+  }
+
+  const normalizedText = normalizeLabelText(text);
+  if (!normalizedText) {
+    throw new Error(t("label_text_required"));
+  }
+
+  const metrics = labelMetrics({ fontSize: DEFAULT_LABEL_FONT_SIZE });
+  const position = currentViewportBoardPosition(metrics.width, metrics.height);
+  const data = await api("create_label", {
+    method: "POST",
+    body: {
+      code: state.board.code,
+      clientId: state.clientId,
+      adminToken: state.adminToken,
+      author: state.userName,
+      text: normalizedText,
+      fontSize: DEFAULT_LABEL_FONT_SIZE,
+      x: position.x,
+      y: position.y,
+    },
+  });
+
+  upsertLabel(data.label);
+  state.selectedLabelId = data.label.id;
+  state.selectedNoteId = null;
+  render();
+}
+
+async function persistLabel(label) {
+  if (!label || !state.board) return;
+
+  state.pendingLabelSaveIds.add(label.id);
+  try {
+    const data = await api("update_label", {
+      method: "POST",
+      body: {
+        ...serializeLabel(label),
+        clientId: state.clientId,
+        adminToken: state.adminToken,
+      },
+    });
+    upsertLabel(data.label);
+  } finally {
+    state.pendingLabelSaveIds.delete(label.id);
+  }
+}
+
+async function saveLabelText(labelId, text) {
+  const label = getLabelById(labelId);
+  if (!label) return;
+  label.text = normalizeLabelText(text);
+  label.author = state.userName;
+  await persistLabel(label);
+  render();
+}
+
+async function adjustLabelFontSize(labelId, delta) {
+  const label = getLabelById(labelId);
+  if (!label || !canEditLabel(label)) return;
+  const nextFontSize = normalizedLabelFontSize((label.fontSize || DEFAULT_LABEL_FONT_SIZE) + delta);
+  if (nextFontSize === normalizedLabelFontSize(label.fontSize)) return;
+  label.fontSize = nextFontSize;
+  label.author = state.userName;
+  await persistLabel(label);
+  render();
+}
+
+async function deleteLabel(labelId) {
+  const label = getLabelById(labelId);
+  if (!label) return;
+
+  await api("delete_label", {
+    method: "POST",
+    body: {
+      id: labelId,
+      clientId: state.clientId,
+      adminToken: state.adminToken,
+    },
+  });
+
+  state.labels = state.labels.filter((entry) => entry.id !== labelId);
+  if (state.selectedLabelId === labelId) {
+    state.selectedLabelId = null;
+  }
+  render();
+}
+
+async function downloadBoardExport(format) {
+  if (!state.board) return;
+
+  const params = new URLSearchParams({
+    action: "export_board",
+    code: state.board.code,
+    format,
+  });
+  if (state.adminToken) {
+    params.set("adminToken", state.adminToken);
+  }
+
+  const response = await fetch(`./api.php?${params.toString()}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || "Export failed");
+  }
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  const fallbackName = `sticky-board-${state.board.code.toLowerCase()}.${format}`;
+  const contentDisposition = response.headers.get("content-disposition") || "";
+  const fileNameMatch = /filename="([^"]+)"/i.exec(contentDisposition);
+  link.href = url;
+  link.download = fileNameMatch?.[1] || fallbackName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showToast(t("export_ready"));
+}
+
+async function saveManagementSettings(openBoardAfterSave = false) {
+  if (!state.board || !isAdmin() || !state.settingsDraft) return;
 
   const payload = {
     ...state.settingsDraft,
     maxNotesPerUser: Number(state.settingsDraft.maxNotesPerUser) || 0,
     maxBoardColumns: Number(state.settingsDraft.maxBoardColumns) || 0,
     maxBoardRows: Number(state.settingsDraft.maxBoardRows) || 0,
+    lineColumns: normalizedGuideCount(state.settingsDraft.lineColumns),
+    lineRows: normalizedGuideCount(state.settingsDraft.lineRows),
     kickBlockMinutes: Math.max(1, Number(state.settingsDraft.kickBlockMinutes) || 15),
   };
 
-  const data = await api("update_supervised_settings", {
+  const data = await api("update_management_settings", {
     method: "POST",
     body: {
       code: state.board.code,
-      teacherToken: state.teacherToken,
+      adminToken: state.adminToken,
       settings: payload,
     },
   });
@@ -1903,14 +2382,14 @@ async function saveSupervisedSettings(openBoardAfterSave = false) {
   }
 }
 
-async function saveTeacherPin(pin) {
-  if (!state.board || !isTeacher()) return;
+async function saveAdminPin(pin) {
+  if (!state.board || !isAdmin()) return;
 
-  await api("set_teacher_pin", {
+  await api("set_admin_pin", {
     method: "POST",
     body: {
       code: state.board.code,
-      teacherToken: state.teacherToken,
+      adminToken: state.adminToken,
       pin,
     },
   });
@@ -1921,12 +2400,12 @@ async function saveTeacherPin(pin) {
 }
 
 async function kickMember(targetClientId, deleteNotes) {
-  if (!state.board || !isTeacher()) return;
+  if (!state.board || !isAdmin()) return;
   const data = await api("kick_member", {
     method: "POST",
     body: {
       code: state.board.code,
-      teacherToken: state.teacherToken,
+      adminToken: state.adminToken,
       targetClientId,
       deleteNotes,
     },
@@ -1939,26 +2418,27 @@ async function kickMember(targetClientId, deleteNotes) {
 async function createBoard(formData) {
   const title = formData.get("title")?.toString().trim() || t("new_board");
   const name = formData.get("userName")?.toString().trim() || defaultUserName();
-  const supervisedMode = formData.get("supervisedMode") === "on";
+  const managementMode = formData.get("managementMode") === "on";
   persistUserName(name);
   const data = await api("create_board", {
     method: "POST",
     body: {
       title,
-      supervisedMode,
-      teacherName: name,
+      managementMode,
+      adminName: name,
       clientId: state.clientId,
     },
   });
   setRoute(data.board.code);
-  if (data.teacherToken) {
-    persistTeacherToken(data.board.code, data.teacherToken);
+  if (adminTokenFromPayload(data)) {
+    persistAdminToken(data.board.code, adminTokenFromPayload(data));
   }
 
-  if (data.board.supervisedMode) {
+  if (isManagementBoard(data.board)) {
     state.board = data.board;
     state.members = [];
     state.notes = [];
+    state.labels = [];
     state.settingsDraft = { ...data.board.settings };
     state.view = "settings";
     state.modal = {
@@ -1979,7 +2459,7 @@ async function joinBoard(formData) {
   const code = normalizeJoinCode(formData.get("code")?.toString() || "");
   const name = formData.get("userName")?.toString().trim() || defaultUserName();
   persistUserName(name);
-  loadTeacherToken(code);
+  loadAdminToken(code);
   const data = await api("join_board", {
     method: "POST",
     body: {
@@ -1992,12 +2472,12 @@ async function joinBoard(formData) {
   await openBoard(data.board.code);
 }
 
-async function teacherLogin({ code, pin, userName }) {
+async function adminLogin({ code, pin, userName }) {
   const normalizedCode = normalizeJoinCode(code);
   const normalizedPin = normalizePinValue(pin);
   const name = userName?.toString().trim() || defaultUserName();
   persistUserName(name);
-  const data = await api("teacher_login", {
+  const data = await api("admin_login", {
     method: "POST",
     body: {
       code: normalizedCode,
@@ -2006,15 +2486,17 @@ async function teacherLogin({ code, pin, userName }) {
       userName: name,
     },
   });
-  persistTeacherToken(normalizedCode, data.teacherToken);
+  persistAdminToken(normalizedCode, adminTokenFromPayload(data));
   setRoute(data.board.code);
   state.board = data.board;
   state.notes = data.notes || [];
+  state.labels = data.labels || [];
   state.members = data.members || [];
   state.settingsDraft = null;
   state.view = "board";
   state.drafts = {};
   state.selectedNoteId = state.notes[0]?.id ?? null;
+  state.selectedLabelId = null;
   state.editingNoteId = null;
   state.qrModalOpen = false;
   state.headerExpanded = false;
@@ -2028,6 +2510,7 @@ function promptDirectBoardJoin(code) {
   state.view = "home";
   state.board = null;
   state.notes = [];
+  state.labels = [];
   state.members = [];
   state.modal = {
     type: "direct-board-name",
@@ -2052,11 +2535,13 @@ async function openBoard(code) {
     const boardData = await fetchBoardByCode(code);
     state.board = boardData.board;
     state.notes = boardData.notes || [];
+    state.labels = boardData.labels || [];
     state.members = boardData.members || [];
     state.settingsDraft = null;
     state.drafts = {};
     state.nextLocalNoteId = -1;
     state.selectedNoteId = state.notes[0]?.id ?? null;
+    state.selectedLabelId = null;
     state.editingNoteId = null;
     state.qrModalOpen = false;
     state.usersPanelOpen = false;
@@ -2068,9 +2553,10 @@ async function openBoard(code) {
     render();
   } catch (error) {
     if (error.status === 403) {
-      persistTeacherToken(code, null);
+      persistAdminToken(code, null);
       state.board = null;
       state.notes = [];
+      state.labels = [];
       state.members = [];
       state.view = "home";
       setRoute("");
@@ -2088,12 +2574,13 @@ async function refreshBoard() {
     payload = await fetchBoardByCode(state.board.code);
   } catch (error) {
     if (error.status === 403) {
-      persistTeacherToken(state.board.code, null);
+      persistAdminToken(state.board.code, null);
       const message = error.payload?.bannedUntil
         ? t("board_blocked_until", { until: new Date(error.payload.bannedUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) })
         : error.message;
       state.board = null;
       state.notes = [];
+      state.labels = [];
       state.members = [];
       state.view = "home";
       setRoute("");
@@ -2104,15 +2591,18 @@ async function refreshBoard() {
     throw error;
   }
   const nextNotes = mergeRemoteNotesWithLocalState(payload.notes || []);
+  const nextLabels = mergeRemoteLabelsWithLocalState(payload.labels || []);
   const nextMembers = payload.members || state.members;
   const currentSignature = boardStateSignature({
     board: state.board,
     notes: state.notes,
+    labels: state.labels,
     members: state.members,
   });
   const nextSignature = boardStateSignature({
     board: payload.board,
     notes: nextNotes,
+    labels: nextLabels,
     members: nextMembers,
   });
 
@@ -2122,9 +2612,13 @@ async function refreshBoard() {
 
   state.board = payload.board;
   state.notes = nextNotes;
+  state.labels = nextLabels;
   state.members = nextMembers;
   if (!state.notes.some((note) => note.id === state.selectedNoteId)) {
     state.selectedNoteId = state.notes[0]?.id ?? null;
+  }
+  if (!state.labels.some((label) => label.id === state.selectedLabelId)) {
+    state.selectedLabelId = null;
   }
   if (!state.notes.some((note) => note.id === state.editingNoteId)) {
     state.editingNoteId = null;
@@ -2152,7 +2646,7 @@ async function createNote() {
   }
 
   const settings = boardSettings();
-  if (settings.maxNotesPerUser > 0 && !isTeacher() && notesOwnedByCurrentUser() >= settings.maxNotesPerUser) {
+  if (settings.maxNotesPerUser > 0 && !isAdmin() && notesOwnedByCurrentUser() >= settings.maxNotesPerUser) {
     showToast(t("max_notes_reached"), true);
     return;
   }
@@ -2187,6 +2681,8 @@ async function createNote() {
     zIndex: state.notes.reduce((max, entry) => Math.max(max, entry.zIndex), 0) + 1,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    likesCount: 0,
+    isLikedByCurrentUser: false,
   };
   upsertNote(note);
   state.drafts[note.id] = {
@@ -2194,6 +2690,7 @@ async function createNote() {
     content: "",
   };
   state.selectedNoteId = note.id;
+  state.selectedLabelId = null;
   state.editingNoteId = note.id;
   state.pendingEditorFocusNoteId = note.id;
   render();
@@ -2204,7 +2701,7 @@ async function updateBoardTitle(title) {
   const trimmed = title.trim() || t("new_board");
   const data = await api("update_board", {
     method: "POST",
-    body: { code: state.board.code, title: trimmed, teacherToken: state.teacherToken },
+    body: { code: state.board.code, title: trimmed, adminToken: state.adminToken },
   });
   state.board = data.board;
   render();
@@ -2224,12 +2721,15 @@ function bringToFront(noteId) {
   if (!note) return;
   note.zIndex = highest + 1;
   state.selectedNoteId = noteId;
+  state.selectedLabelId = null;
 }
 
 function openNoteEditor(noteId) {
   clearSettlingNote();
   state.selectedNoteId = noteId;
+  state.selectedLabelId = null;
   state.editingNoteId = noteId;
+  state.mobileEditorToolsOpen = false;
   const draft = ensureDraft(noteId);
   bringToFront(noteId);
   state.pendingEditorFocusNoteId = noteId;
@@ -2311,10 +2811,10 @@ function renderHome() {
               <button
                 type="button"
                 class="icon-button secondary-button"
-                data-action="open-teacher-login"
+                data-action="open-admin-login"
                 data-tooltip="${t("login_with_pin")}"
                 aria-label="${t("login_with_pin")}"
-                style="display:${state.homeJoinBoardAccess?.teacherLoginAvailable ? "inline-flex" : "none"}"
+                style="display:${isAdminLoginAvailable(state.homeJoinBoardAccess) ? "inline-flex" : "none"}"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5Zm-3 8V7a3 3 0 1 1 6 0v3Zm3 3a2 2 0 0 1 1 3.73V19h-2v-2.27A2 2 0 0 1 12 13Z" fill="currentColor"/></svg>
               </button>
@@ -2343,23 +2843,23 @@ function renderHome() {
       type: "new-board",
       title: t("new_board"),
       userName: state.userName || defaultUserName(),
-      supervisedMode: false,
+      managementMode: false,
     };
     render();
   });
 
   const joinForm = app.querySelector('[data-form="join-board"]');
   const joinUserNameInput = joinForm.querySelector('input[name="userName"]');
-  const teacherLoginButton = joinForm.querySelector('[data-action="open-teacher-login"]');
+  const adminLoginButton = joinForm.querySelector('[data-action="open-admin-login"]');
 
   joinUserNameInput.addEventListener("input", (event) => {
     state.homeJoinUserName = event.currentTarget.value;
   });
 
-  teacherLoginButton.addEventListener("click", () => {
-    if (!state.homeJoinBoardAccess?.teacherLoginAvailable) return;
+  adminLoginButton.addEventListener("click", () => {
+    if (!isAdminLoginAvailable(state.homeJoinBoardAccess)) return;
     state.modal = {
-      type: "teacher-login",
+      type: "admin-login",
       code: state.homeJoinCode,
       userName: joinUserNameInput.value.trim() || state.homeJoinUserName || state.userName,
       pin: "",
@@ -2416,17 +2916,17 @@ function renderModal() {
     `;
   }
 
-  if (state.modal.type === "teacher-login") {
+  if (state.modal.type === "admin-login") {
     return `
       <div class="app-modal-overlay" data-action="close-modal">
         <div class="panel app-modal" data-modal-root>
           <h3>${t("login_with_pin")}</h3>
           <p>${escapeHtml(state.modal.code || "")}</p>
-          ${renderPinInputGroup("teacher-login-modal", state.modal.pin || "")}
+          ${renderPinInputGroup("admin-login-modal", state.modal.pin || "")}
           ${state.modal.error ? `<p class="modal-error">${escapeHtml(state.modal.error)}</p>` : ""}
           <div class="modal-actions">
             <button type="button" class="secondary-button" data-action="cancel-pin-flow">${t("close")}</button>
-            <button type="button" data-action="submit-teacher-login">${t("login_with_pin")}</button>
+            <button type="button" data-action="submit-admin-login">${t("login_with_pin")}</button>
           </div>
         </div>
       </div>
@@ -2472,7 +2972,7 @@ function renderModal() {
               <input name="userName" maxlength="60" value="${escapeHtml(state.modal.userName || state.userName)}" />
             </label>
             <label class="checkbox-row">
-              <input type="checkbox" name="supervisedMode" ${state.modal.supervisedMode ? "checked" : ""} />
+              <input type="checkbox" name="managementMode" ${state.modal.managementMode ? "checked" : ""} />
               <span>${t("supervised_mode")}</span>
             </label>
             <div class="modal-actions">
@@ -2485,88 +2985,283 @@ function renderModal() {
     `;
   }
 
+  if (state.modal.type === "label-editor") {
+    const isEditingLabel = Number.isFinite(Number(state.modal.labelId));
+    return `
+      <div class="app-modal-overlay" data-action="close-modal">
+        <div class="panel app-modal" data-modal-root>
+          <h3>${isEditingLabel ? t("edit_label") : t("create_label")}</h3>
+          <form data-form="label-editor-modal" class="modal-form">
+            <label>
+              <span>${t("label_text")}</span>
+              <input name="text" maxlength="180" value="${escapeHtml(state.modal.text || "")}" />
+            </label>
+            ${state.modal.error ? `<p class="modal-error">${escapeHtml(state.modal.error)}</p>` : ""}
+            <div class="modal-actions">
+              <button type="button" class="secondary-button" data-action="close-label-modal">${t("close")}</button>
+              <button type="submit">${isEditingLabel ? t("save_label") : t("create_label")}</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
+  if (state.modal.type === "line-settings") {
+    return `
+      <div class="app-modal-overlay" data-action="close-modal">
+        <div class="panel app-modal" data-modal-root>
+          <h3>${t("board_lines")}</h3>
+          <form data-form="line-settings-modal" class="modal-form">
+            <div class="settings-grid">
+              <label>
+                <span>${t("line_columns")}</span>
+                <input type="number" min="0" name="lineColumns" value="${normalizedGuideCount(state.modal.lineColumns)}" />
+              </label>
+              <label>
+                <span>${t("line_rows")}</span>
+                <input type="number" min="0" name="lineRows" value="${normalizedGuideCount(state.modal.lineRows)}" />
+              </label>
+            </div>
+            <div class="modal-actions">
+              <button type="button" class="secondary-button" data-action="close-line-settings">${t("close")}</button>
+              <button type="submit">${t("save_settings")}</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
   return "";
 }
 
 function renderSettingsScreen() {
   const settings = boardSettings();
+  const settingsCopy = state.lang === "nl"
+      ? {
+        userOptionsTitle: "Gebruikersopties",
+        boardLayoutTitle: "Bord en vakken",
+        boardSizeTitle: "Bordformaat",
+        boardWidthShort: "Breedte",
+        boardHeightShort: "Hoogte",
+        maxNotesTitle: "Maximum notes per gebruiker",
+        boxesTitle: "Vakken",
+        boxesHorizontalShort: "Horizontaal",
+        boxesVerticalShort: "Verticaal",
+      }
+    : {
+        userOptionsTitle: "User options",
+        boardLayoutTitle: "Board and sections",
+        boardSizeTitle: "Board size",
+        boardWidthShort: "Width",
+        boardHeightShort: "Height",
+        maxNotesTitle: "Maximum notes per user",
+        boxesTitle: "Sections",
+        boxesHorizontalShort: "Horizontal",
+        boxesVerticalShort: "Vertical",
+      };
   app.innerHTML = `
     <main class="home-shell settings-shell">
       <section class="hero-card settings-card">
-        <div class="hero-copy">
-          <p class="eyebrow">${t("supervised_mode")}</p>
-          <h1>${escapeHtml(state.board?.title || t("new_board"))}</h1>
-          <p class="intro">${t("settings_intro", { code: state.board?.code || "" })}</p>
-        </div>
-        <form class="panel settings-form" data-form="supervised-settings">
-          <label class="checkbox-row">
-            <input type="checkbox" name="allowViewerCreateNotes" ${settings.allowViewerCreateNotes ? "checked" : ""} />
-            <span>${t("allow_viewer_create_notes")}</span>
-          </label>
-          <label class="checkbox-row">
-            <input type="checkbox" name="allowOnlyOwnMove" ${settings.allowOnlyOwnMove ? "checked" : ""} />
-            <span>${t("allow_only_own_move")}</span>
-          </label>
-          <label class="checkbox-row">
-            <input type="checkbox" name="allowOnlyOwnDelete" ${settings.allowOnlyOwnDelete ? "checked" : ""} />
-            <span>${t("allow_only_own_delete")}</span>
-          </label>
-          <label class="checkbox-row">
-            <input type="checkbox" name="allowOnlyOwnEdit" ${settings.allowOnlyOwnEdit ? "checked" : ""} />
-            <span>${t("allow_only_own_edit")}</span>
-          </label>
-          <label>
-            <span>${t("max_notes_per_user")}</span>
-            <input type="number" min="0" name="maxNotesPerUser" value="${settings.maxNotesPerUser}" />
-          </label>
-          <div class="settings-grid">
-            <label>
-              <span>${t("max_board_columns")}</span>
-              <input type="number" min="${MIN_BOARD_COLUMNS}" name="maxBoardColumns" value="${settings.maxBoardColumns}" />
-            </label>
-            <label>
-              <span>${t("max_board_rows")}</span>
-              <input type="number" min="${MIN_BOARD_ROWS}" name="maxBoardRows" value="${settings.maxBoardRows}" />
-            </label>
+        <div class="hero-copy settings-hero-copy">
+          <div class="settings-hero-top">
+            <p class="eyebrow">${t("supervised_mode")}</p>
+            <h1>${escapeHtml(state.board?.title || t("new_board"))}</h1>
+            <div class="settings-meta-row">
+              <div class="settings-meta-pill">
+                <span>${t("share_code")}</span>
+                <strong>${escapeHtml(state.board?.code || "")}</strong>
+              </div>
+              <div class="settings-meta-actions">
+                <button type="button" class="secondary-button settings-meta-button" data-action="toggle-qr" data-tooltip="${t("open_qr")}" aria-label="${t("open_qr")}">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h8v8H3zM5 5v4h4V5zm8-2h8v8h-8zm2 2v4h4V5zM3 13h8v8H3zm2 2v4h4v-4zm10-2h2v2h-2zm2 2h2v2h-2zm-4 0h2v6h-2zm6 2h2v4h-4v-2h2zm-4 0h2v2h-2z" fill="currentColor"/></svg>
+                </button>
+                <button type="button" class="secondary-button settings-meta-button settings-pin-button" data-action="change-pin">${t("change_pin")}</button>
+              </div>
+            </div>
           </div>
-          <label>
-            <span>${t("kick_block_minutes")}</span>
-            <input type="number" min="1" name="kickBlockMinutes" value="${settings.kickBlockMinutes}" />
-          </label>
-          <div class="modal-actions">
-            <button type="button" class="secondary-button" data-action="change-pin">${t("change_pin")}</button>
-            <button type="submit">${t("open_board")}</button>
+          <div class="modal-actions settings-actions settings-hero-actions">
+            <button type="submit" form="management-settings-form">${t("open_board")}</button>
+          </div>
+        </div>
+        <form class="panel settings-form" data-form="management-settings" id="management-settings-form">
+          <div class="settings-form-grid">
+            <section class="settings-composite-card settings-main-block">
+              <div class="settings-block-title">${settingsCopy.userOptionsTitle}</div>
+              <label class="checkbox-row settings-toggle-card">
+                <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6h14v2H5zm0 5h10v2H5zm0 5h14v2H5z" fill="currentColor"/></svg></span>
+                <input type="checkbox" name="allowViewerCreateNotes" ${settings.allowViewerCreateNotes ? "checked" : ""} />
+                <span>${t("allow_viewer_create_notes")}</span>
+              </label>
+              <label class="checkbox-row settings-toggle-card">
+                <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 21s-6.72-4.34-9.2-8.06C.63 9.74 2.24 5 6.46 5c2.13 0 3.36 1.16 4.19 2.3C11.48 6.16 12.71 5 14.84 5 19.06 5 20.67 9.74 18.2 12.94 15.72 16.66 12 21 12 21Z" fill="currentColor"/></svg></span>
+                <input type="checkbox" name="likesEnabled" ${settings.likesEnabled ? "checked" : ""} />
+                <span>${t("likes_enabled")}</span>
+              </label>
+              <label class="checkbox-row settings-toggle-card">
+                <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 12h16M12 4v16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+                <input type="checkbox" name="allowOnlyOwnMove" ${settings.allowOnlyOwnMove ? "checked" : ""} />
+                <span>${t("allow_only_own_move")}</span>
+              </label>
+              <label class="checkbox-row settings-toggle-card">
+                <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4zm-1 6h8v9H8z" fill="currentColor"/></svg></span>
+                <input type="checkbox" name="allowOnlyOwnDelete" ${settings.allowOnlyOwnDelete ? "checked" : ""} />
+                <span>${t("allow_only_own_delete")}</span>
+              </label>
+              <label class="checkbox-row settings-toggle-card">
+                <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m4 15.5 9.9-9.9 4.5 4.5-9.9 9.9H4zm14.7-10.8 1.6-1.6a1.5 1.5 0 0 1 2.1 2.1l-1.6 1.6z" fill="currentColor"/></svg></span>
+                <input type="checkbox" name="allowOnlyOwnEdit" ${settings.allowOnlyOwnEdit ? "checked" : ""} />
+                <span>${t("allow_only_own_edit")}</span>
+              </label>
+              <label class="settings-field">
+                <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 9h6v6H9z" fill="currentColor"/></svg></span>
+                <span>${settingsCopy.maxNotesTitle}</span>
+                <input type="number" min="0" name="maxNotesPerUser" value="${settings.maxNotesPerUser}" />
+              </label>
+              <label class="settings-field">
+                <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 7v5l3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/></svg></span>
+                <span>${t("kick_block_minutes")}</span>
+                <input type="number" min="1" name="kickBlockMinutes" value="${settings.kickBlockMinutes}" />
+              </label>
+            </section>
+            <section class="settings-composite-card settings-main-block">
+              <div class="settings-block-title">${settingsCopy.boardLayoutTitle}</div>
+              <div class="settings-subsection">
+                <div class="settings-card-header">
+                  <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+                  <div>
+                    <strong>${settingsCopy.boardSizeTitle}</strong>
+                  </div>
+                </div>
+                <div class="settings-pair-grid">
+                  <label class="settings-field compact">
+                    <span>${settingsCopy.boardWidthShort}</span>
+                    <input type="number" min="${MIN_BOARD_COLUMNS}" name="maxBoardColumns" value="${settings.maxBoardColumns}" />
+                  </label>
+                  <label class="settings-field compact">
+                    <span>${settingsCopy.boardHeightShort}</span>
+                    <input type="number" min="${MIN_BOARD_ROWS}" name="maxBoardRows" value="${settings.maxBoardRows}" />
+                  </label>
+                </div>
+              </div>
+              <div class="settings-subsection">
+                <div class="settings-card-header">
+                  <span class="settings-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+                  <div>
+                    <strong>${settingsCopy.boxesTitle}</strong>
+                  </div>
+                </div>
+                <div class="settings-pair-grid">
+                  <label class="settings-field compact">
+                    <span>${settingsCopy.boxesHorizontalShort}</span>
+                    <input type="number" min="0" name="lineColumns" value="${displayGuideCountValue(settings.lineColumns)}" />
+                  </label>
+                  <label class="settings-field compact">
+                    <span>${settingsCopy.boxesVerticalShort}</span>
+                    <input type="number" min="0" name="lineRows" value="${displayGuideCountValue(settings.lineRows)}" />
+                  </label>
+                </div>
+              </div>
+              <div class="settings-export-row settings-inline-card">
+                <span class="panel-caption">${t("export_board")}</span>
+                <div class="settings-export-actions">
+                  <button type="button" class="secondary-button" data-action="export-board" data-format="txt">TXT</button>
+                  <button type="button" class="secondary-button" data-action="export-board" data-format="csv">CSV</button>
+                </div>
+              </div>
+            </section>
           </div>
         </form>
       </section>
+      ${state.qrModalOpen ? `
+        <div class="share-overlay">
+          <div class="brand-block share-panel">
+            <div class="share-panel-header">
+              <strong>${t("share_code")}: ${state.board.code}</strong>
+              <button class="link-button" data-action="close-qr" type="button">${t("close")}</button>
+            </div>
+            <img class="qr-image" src="${buildQrCodeUrl()}" alt="${t("qr_title")}" />
+            <input readonly value="${escapeHtml(buildBoardUrl())}" />
+            <button data-action="copy-link" type="button">${t("copy_link")}</button>
+          </div>
+        </div>
+      ` : ""}
       ${renderModal()}
     </main>
   `;
 
-  app.querySelector('[data-form="supervised-settings"]').addEventListener("submit", async (event) => {
+  app.querySelector('[data-form="management-settings"]').addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     state.settingsDraft = {
       allowViewerCreateNotes: form.get("allowViewerCreateNotes") === "on",
+      likesEnabled: form.get("likesEnabled") === "on",
       allowOnlyOwnMove: form.get("allowOnlyOwnMove") === "on",
       allowOnlyOwnDelete: form.get("allowOnlyOwnDelete") === "on",
       allowOnlyOwnEdit: form.get("allowOnlyOwnEdit") === "on",
       maxNotesPerUser: Number(form.get("maxNotesPerUser") || 0),
       maxBoardColumns: Math.max(MIN_BOARD_COLUMNS, Number(form.get("maxBoardColumns") || DEFAULT_BOARD_COLUMNS)),
       maxBoardRows: Math.max(MIN_BOARD_ROWS, Number(form.get("maxBoardRows") || DEFAULT_BOARD_ROWS)),
+      lineColumns: normalizedGuideCount(form.get("lineColumns") || 0),
+      lineRows: normalizedGuideCount(form.get("lineRows") || 0),
       kickBlockMinutes: Number(form.get("kickBlockMinutes") || 15),
     };
 
     try {
-      await saveSupervisedSettings(true);
+      await saveManagementSettings(true);
     } catch (error) {
       showToast(error.message, true);
     }
   });
 
+  app.querySelectorAll('[data-form="management-settings"] input[name="lineColumns"], [data-form="management-settings"] input[name="lineRows"]').forEach((input) => {
+    input.addEventListener("input", () => normalizeGuideCountInput(input));
+    input.addEventListener("change", () => normalizeGuideCountInput(input));
+  });
+
   app.querySelector('[data-action="change-pin"]').addEventListener("click", () => {
     state.modal = { type: "set-pin", pin: "", confirmPin: "", locked: false };
     render();
+  });
+
+  app.querySelectorAll('[data-action="toggle-qr"]').forEach((button) => {
+    button.addEventListener("click", () => {
+      state.qrModalOpen = !state.qrModalOpen;
+      render();
+    });
+  });
+
+  const shareOverlay = app.querySelector(".share-overlay");
+  if (shareOverlay) {
+    shareOverlay.addEventListener("click", (event) => {
+      if (event.target !== event.currentTarget) return;
+      state.qrModalOpen = false;
+      render();
+    });
+  }
+
+  app.querySelectorAll('[data-action="close-qr"]').forEach((button) => {
+    button.addEventListener("click", () => {
+      state.qrModalOpen = false;
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="copy-link"]').forEach((button) => {
+    button.addEventListener("click", () => {
+      copyBoardLink().catch(() => {});
+    });
+  });
+
+  app.querySelectorAll('[data-action="export-board"]').forEach((button) => {
+    button.addEventListener("click", async () => {
+      try {
+        await downloadBoardExport(button.dataset.format || "txt");
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    });
   });
 
   bindModalHandlers();
@@ -2586,14 +3281,20 @@ function bindModalHandlers() {
   if (state.modal.type === "confirm-pin") {
     focusPinDigit("pin-confirm-entry", 0);
   }
-  if (state.modal.type === "teacher-login") {
-    focusPinDigit("teacher-login-modal", 0);
+  if (state.modal.type === "admin-login") {
+    focusPinDigit("admin-login-modal", 0);
   }
   if (state.modal.type === "direct-board-name") {
     root.querySelector('[data-role="direct-board-user-name"]')?.focus();
   }
   if (state.modal.type === "new-board") {
     root.querySelector('[data-form="new-board-modal"] input[name="title"]')?.focus();
+  }
+  if (state.modal.type === "label-editor") {
+    root.querySelector('[data-form="label-editor-modal"] input[name="text"]')?.focus();
+  }
+  if (state.modal.type === "line-settings") {
+    root.querySelector('[data-form="line-settings-modal"] input[name="lineColumns"]')?.focus();
   }
 
   app.querySelectorAll('[data-action="close-modal"]').forEach((element) => {
@@ -2626,6 +3327,13 @@ function bindModalHandlers() {
   });
 
   app.querySelectorAll('[data-action="close-new-board-modal"]').forEach((button) => {
+    button.addEventListener("click", () => {
+      state.modal = null;
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="close-label-modal"], [data-action="close-line-settings"]').forEach((button) => {
     button.addEventListener("click", () => {
       state.modal = null;
       render();
@@ -2679,7 +3387,7 @@ function bindModalHandlers() {
         ...state.modal,
         title: formData.get("title")?.toString() || t("new_board"),
         userName: formData.get("userName")?.toString() || state.userName,
-        supervisedMode: formData.get("supervisedMode") === "on",
+        managementMode: formData.get("managementMode") === "on",
       };
     });
 
@@ -2690,6 +3398,61 @@ function bindModalHandlers() {
       } catch (error) {
         showToast(error.message, true);
       }
+    });
+  });
+
+  app.querySelectorAll('[data-form="label-editor-modal"]').forEach((form) => {
+    form.addEventListener("input", () => {
+      const formData = new FormData(form);
+      state.modal = {
+        ...state.modal,
+        text: formData.get("text")?.toString() || "",
+        error: "",
+      };
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = normalizeLabelText(new FormData(form).get("text")?.toString() || "");
+      if (!text) {
+        state.modal = {
+          ...state.modal,
+          error: t("label_text_required"),
+        };
+        render();
+        return;
+      }
+
+      try {
+        const labelId = Number(state.modal?.labelId);
+        if (Number.isFinite(labelId) && labelId > 0) {
+          await saveLabelText(labelId, text);
+        } else {
+          await createLabel(text);
+        }
+        state.modal = null;
+        render();
+      } catch (error) {
+        state.modal = {
+          ...state.modal,
+          error: error.message,
+        };
+        render();
+      }
+    });
+  });
+
+  app.querySelectorAll('[data-form="line-settings-modal"]').forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const formData = new FormData(form);
+      state.settingsDraft = {
+        ...boardSettings(),
+        lineColumns: normalizedGuideCount(formData.get("lineColumns") || 0),
+        lineRows: normalizedGuideCount(formData.get("lineRows") || 0),
+      };
+      state.modal = null;
+      render();
     });
   });
 
@@ -2731,7 +3494,7 @@ function bindModalHandlers() {
         return;
       }
       try {
-        await saveTeacherPin(pin);
+        await saveAdminPin(pin);
       } catch (error) {
         state.modal = {
           ...state.modal,
@@ -2743,9 +3506,9 @@ function bindModalHandlers() {
     });
   });
 
-  app.querySelectorAll('[data-action="submit-teacher-login"]').forEach((button) => {
+  app.querySelectorAll('[data-action="submit-admin-login"]').forEach((button) => {
     button.addEventListener("click", async () => {
-      const pin = syncPinGroup("teacher-login-modal");
+      const pin = syncPinGroup("admin-login-modal");
       if (!/^\d{4}$/.test(pin)) {
         state.modal = {
           ...state.modal,
@@ -2757,7 +3520,7 @@ function bindModalHandlers() {
       }
 
       try {
-        await teacherLogin({
+        await adminLogin({
           code: state.modal?.code || state.homeJoinCode,
           pin,
           userName: state.modal?.userName || state.homeJoinUserName || state.userName,
@@ -2791,7 +3554,7 @@ function getCanvasMetrics() {
   const minWidth = normalizedBoardColumns() * NOTE_SIZE;
   const minHeight = normalizedBoardRows() * NOTE_SIZE;
 
-  if (state.notes.length === 0) {
+  if (state.notes.length === 0 && state.labels.length === 0) {
     return {
       width: minWidth,
       height: minHeight,
@@ -2809,6 +3572,14 @@ function getCanvasMetrics() {
     minY = Math.min(minY, note.y);
     maxX = Math.max(maxX, note.x + noteWidth);
     maxY = Math.max(maxY, note.y + noteHeight);
+  });
+
+  state.labels.forEach((label) => {
+    const metrics = labelMetrics(label);
+    minX = Math.min(minX, label.x);
+    minY = Math.min(minY, label.y);
+    maxX = Math.max(maxX, label.x + metrics.width);
+    maxY = Math.max(maxY, label.y + metrics.height);
   });
 
   return {
@@ -2830,7 +3601,7 @@ function fitNotesInView() {
   const viewport = document.querySelector(".board-viewport");
   const metrics = getCanvasMetrics();
 
-  if (!viewport || state.notes.length === 0) {
+  if (!viewport || (state.notes.length === 0 && state.labels.length === 0)) {
     state.zoom = 1;
     render();
     return;
@@ -2857,7 +3628,7 @@ function animateFitNotesInView() {
   const viewport = document.querySelector(".board-viewport");
   const metrics = getCanvasMetrics();
 
-  if (!viewport || state.notes.length === 0) {
+  if (!viewport || (state.notes.length === 0 && state.labels.length === 0)) {
     state.zoom = 1;
     render();
     return;
@@ -3153,6 +3924,11 @@ function syncEditorPanel() {
 
   const note = editingNote();
   panel.classList.toggle("is-hidden", !note);
+  panel.classList.toggle("is-collapsed-mobile", Boolean(
+    note
+    && isCompactViewport()
+    && !state.mobileEditorToolsOpen
+  ));
   if (!note) return;
 
   panel.querySelectorAll("[data-action='color']").forEach((button) => {
@@ -3209,6 +3985,7 @@ function updateEditorPanelPosition() {
     panelSection.style.top = "";
     panelSection.style.right = "";
     panelSection.style.bottom = "";
+    panelSection.style.maxHeight = "";
     return;
   }
 
@@ -3271,24 +4048,118 @@ function restoreViewportBeforeSmoothFocus() {
   viewport.style.scrollBehavior = previousScrollBehavior;
 }
 
+function renderBoardGuideOverlay(metrics) {
+  const lineColumns = normalizedGuideCount(boardSettings().lineColumns);
+  const lineRows = normalizedGuideCount(boardSettings().lineRows);
+  if (lineColumns <= 0 && lineRows <= 0) {
+    return "";
+  }
+
+  const columnLines = Array.from({ length: Math.max(0, lineColumns - 1) }, (_entry, index) => {
+    const position = (((index + 1) / lineColumns) * 100).toFixed(4);
+    return `<div class="board-guide-line vertical" style="left:${position}%;" aria-hidden="true"></div>`;
+  }).join("");
+  const rowLines = Array.from({ length: Math.max(0, lineRows - 1) }, (_entry, index) => {
+    const position = (((index + 1) / lineRows) * 100).toFixed(4);
+    return `<div class="board-guide-line horizontal" style="top:${position}%;" aria-hidden="true"></div>`;
+  }).join("");
+
+  return `
+    <div
+      class="board-guide-grid ${lineColumns > 0 ? "has-columns" : ""} ${lineRows > 0 ? "has-rows" : ""}"
+      aria-hidden="true"
+      style="width:${metrics.width}px; height:${metrics.height}px;"
+    >${columnLines}${rowLines}</div>
+  `;
+}
+
+function renderBoardLabel(label) {
+  const selected = state.selectedLabelId === label.id;
+  const labelCanEdit = canEditLabel(label);
+  const labelCanDelete = canDeleteLabel(label);
+  const fontSize = normalizedLabelFontSize(label.fontSize);
+
+  return `
+    <div
+      class="board-label ${selected ? "selected" : ""}"
+      data-label-id="${label.id}"
+      style="left:${label.x}px; top:${label.y}px; z-index:${label.zIndex}; --label-font-size:${fontSize}px;"
+    >
+      <div class="board-label-text">${escapeHtml(label.text)}</div>
+      ${selected ? `
+        <div class="board-label-actions">
+          ${labelCanEdit ? `
+            <button
+              class="board-label-action"
+              type="button"
+              data-action="decrease-label-size"
+              data-id="${label.id}"
+              data-tooltip="${t("decrease_font_size")}"
+              aria-label="${t("decrease_font_size")}"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+            </button>
+            <button
+              class="board-label-action"
+              type="button"
+              data-action="increase-label-size"
+              data-id="${label.id}"
+              data-tooltip="${t("increase_font_size")}"
+              aria-label="${t("increase_font_size")}"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6v12M6 12h12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+            </button>
+          ` : ""}
+          ${labelCanEdit ? `
+            <button
+              class="board-label-action"
+              type="button"
+              data-action="edit-label"
+              data-id="${label.id}"
+              data-tooltip="${t("edit_label")}"
+              aria-label="${t("edit_label")}"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 15.5 9.9-9.9 4.5 4.5-9.9 9.9H4zm14.7-10.8 1.6-1.6a1.5 1.5 0 0 1 2.1 2.1l-1.6 1.6z" fill="currentColor"/></svg>
+            </button>
+          ` : ""}
+          ${labelCanDelete ? `
+            <button
+              class="board-label-action"
+              type="button"
+              data-action="delete-label"
+              data-id="${label.id}"
+              data-tooltip="${t("delete_label")}"
+              aria-label="${t("delete_label")}"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.41 5 12 10.59 17.59 5 19 6.41 13.41 12 19 17.59 17.59 19 12 13.41 6.41 19 5 17.59 10.59 12 5 6.41z" fill="currentColor"/></svg>
+            </button>
+          ` : ""}
+        </div>
+      ` : ""}
+    </div>
+  `;
+}
+
 function renderBoard() {
   const note = editingNote();
   const metrics = getCanvasMetrics();
   const viewportSize = getBoardViewportSize();
   const canvasWidth = Math.round(metrics.width * state.zoom);
   const canvasHeight = Math.round(metrics.height * state.zoom);
-  const viewportContentWidth = Math.max(viewportSize.width, canvasWidth);
-  const viewportContentHeight = Math.max(viewportSize.height, canvasHeight);
-  const canvasOffsetX = Math.max(0, Math.round((viewportContentWidth - canvasWidth) / 2));
-  const canvasOffsetY = Math.max(0, Math.round((viewportContentHeight - canvasHeight) / 2));
+  const viewportLayout = computeBoardViewportLayout(state.zoom, viewportSize.width, viewportSize.height);
+  const viewportContentWidth = viewportLayout.viewportContentWidth;
+  const viewportContentHeight = viewportLayout.viewportContentHeight;
+  const canvasOffsetX = viewportLayout.canvasOffsetX;
+  const canvasOffsetY = viewportLayout.canvasOffsetY;
   const boardLabel = `${state.board.title} - ${state.userName}`;
   const hasUnsavedNewNote = state.notes.some((entry) => isLocalNoteId(entry.id));
-  const canShowQr = !state.board?.supervisedMode || isTeacher();
+  const canShowQr = !isManagementBoard(state.board) || isAdmin();
   const isEditingBoard = Boolean(note);
   const boardActionDisabled = isEditingBoard ? "disabled" : "";
   const editorPanelClass = [
     "note-editor-panel",
     note ? "" : "is-hidden",
+    note && isCompactViewport() && !state.mobileEditorToolsOpen ? "is-collapsed-mobile" : "",
     note && state.viewportFocus && state.viewportFocusBehavior === "smooth" ? "is-primed" : "",
   ].filter(Boolean).join(" ");
   app.innerHTML = `
@@ -3299,8 +4170,10 @@ function renderBoard() {
             <div class="board-viewport-content" style="width:${viewportContentWidth}px; height:${viewportContentHeight}px;">
               <div class="board-canvas" style="left:${canvasOffsetX}px; top:${canvasOffsetY}px; width:${canvasWidth}px; height:${canvasHeight}px;">
                 <div class="board-canvas-content" style="width:${metrics.width}px; height:${metrics.height}px; transform:scale(${state.zoom});">
+                  ${renderBoardGuideOverlay(metrics)}
+                  ${state.labels.map(renderBoardLabel).join("")}
                   ${state.notes.map(renderNoteCard).join("")}
-                  ${state.notes.length === 0 ? `<div class="empty-state">${t("empty_board")}</div>` : ""}
+                  ${state.notes.length === 0 && state.labels.length === 0 ? `<div class="empty-state">${t("empty_board")}</div>` : ""}
                 </div>
               </div>
             </div>
@@ -3352,22 +4225,27 @@ function renderBoard() {
           <button class="icon-button" data-action="fit-notes" type="button" data-tooltip="${t("fit_notes")}" aria-label="${t("fit_notes")}" ${boardActionDisabled}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5v2H6v3zm10-5h5v5h-2V6h-3zM6 15v3h3v2H4v-5zm11 0h2v5h-5v-2h3z" fill="currentColor"/></svg>
           </button>
-          ${canOpenTeacherLoginOnBoard() ? `
-            <button class="icon-button" data-action="open-board-teacher-login" type="button" data-tooltip="${t("login_with_pin")}" aria-label="${t("login_with_pin")}" ${boardActionDisabled}>
+          ${canManageLabels() ? `
+            <button class="icon-button" data-action="add-label" type="button" data-tooltip="${canCreateNotes() ? t("add_label") : t("users_cannot_add_notes")}" aria-label="${t("add_label")}" ${canCreateNotes() && !isEditingBoard ? "" : "disabled"}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14v2H5zm0 5h10v2H5zm0 5h14v2H5z" fill="currentColor"/></svg>
+            </button>
+          ` : ""}
+          ${canOpenAdminLoginOnBoard() ? `
+            <button class="icon-button" data-action="open-board-admin-login" type="button" data-tooltip="${t("login_with_pin")}" aria-label="${t("login_with_pin")}" ${boardActionDisabled}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5Zm-3 8V7a3 3 0 1 1 6 0v3Zm3 3a2 2 0 0 1 1 3.73V19h-2v-2.27A2 2 0 0 1 12 13Z" fill="currentColor"/></svg>
             </button>
           ` : ""}
-          ${isTeacher() ? `
+          ${isAdmin() ? `
             <button class="icon-button" data-action="open-settings" type="button" data-tooltip="${t("save_settings")}" aria-label="${t("save_settings")}" ${boardActionDisabled}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94a7.43 7.43 0 0 0 .05-.94 7.43 7.43 0 0 0-.05-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.28 7.28 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.49.42l-.36 2.54c-.58.22-1.12.53-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.71 8.48a.5.5 0 0 0 .12.64l2.03 1.58a7.43 7.43 0 0 0-.05.94c0 .32.02.63.05.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96c.5.41 1.05.72 1.63.94l.36 2.54a.5.5 0 0 0 .49.42h3.8a.5.5 0 0 0 .49-.42l.36-2.54c.58-.22 1.12-.53 1.63-.94l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64ZM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Z" fill="currentColor"/></svg>
             </button>
           ` : ""}
-          ${isTeacher() ? `
+          ${isAdmin() ? `
             <button class="icon-button" data-action="toggle-users" type="button" data-tooltip="${t("manage_users")}" aria-label="${t("manage_users")}" ${boardActionDisabled}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 11c1.66 0 2.99-1.57 2.99-3.5S17.66 4 16 4s-3 1.57-3 3.5S14.34 11 16 11Zm-8 0c1.66 0 2.99-1.57 2.99-3.5S9.66 4 8 4 5 5.57 5 7.5 6.34 11 8 11Zm0 2c-2.33 0-7 1.17-7 3.5V20h14v-3.5C15 14.17 10.33 13 8 13Zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.95 1.97 3.45V20h6v-3.5c0-2.33-4.67-3.5-7-3.5Z" fill="currentColor"/></svg>
             </button>
           ` : ""}
-          <button class="icon-button" data-action="presentation-mode" type="button" data-tooltip="${t("presentation_mode")}" aria-label="${t("presentation_mode")}" ${boardActionDisabled}>
+          <button class="icon-button presentation-mode-button" data-action="presentation-mode" type="button" data-tooltip="${t("presentation_mode")}" aria-label="${t("presentation_mode")}" ${boardActionDisabled}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H4zm2 2v6h12V7zm4 10h4v2h-4z" fill="currentColor"/></svg>
           </button>
         </div>
@@ -3461,33 +4339,158 @@ function renderBoard() {
 
   const boardViewport = app.querySelector(".board-viewport");
   if (boardViewport) {
+    const activeTouchPointers = new Map();
+    let pinchZoom = null;
+    const viewportContent = app.querySelector(".board-viewport-content");
+    const boardCanvas = app.querySelector(".board-canvas");
+    const boardContent = app.querySelector(".board-canvas-content");
+    const blockedInteractiveSelector = ".floating-bar, .floating-tools, .note-editor-panel, .share-overlay, .users-panel, .app-modal-overlay";
+    const blockedBoardPanSelector = `.sticky-note, .board-label, ${blockedInteractiveSelector}`;
+
+    const releaseCurrentInteraction = () => {
+      if (state.boardPan?.pointerId !== undefined && boardViewport.hasPointerCapture?.(state.boardPan.pointerId)) {
+        try {
+          boardViewport.releasePointerCapture(state.boardPan.pointerId);
+        } catch (_error) {
+          // Ignore release failures for synthetic or already-ended pointers.
+        }
+      }
+      state.boardPan = null;
+      state.drag = null;
+      boardViewport.classList.remove("is-panning");
+    };
+
+    const updateTrackedTouchPointer = (event) => {
+      if (event.pointerType !== "touch") return false;
+      if (event.target.closest(blockedInteractiveSelector)) return false;
+      activeTouchPointers.set(event.pointerId, {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      });
+      return true;
+    };
+
+    const clearTrackedTouchPointer = (pointerId) => {
+      activeTouchPointers.delete(pointerId);
+      if (activeTouchPointers.size < 2 && pinchZoom) {
+        const finalZoom = roundZoomValue(pinchZoom.currentZoom);
+        const finalScrollLeft = Math.round(boardViewport.scrollLeft);
+        const finalScrollTop = Math.round(boardViewport.scrollTop);
+        pinchZoom = null;
+        boardViewport.classList.remove("is-pinching");
+        state.zoom = finalZoom;
+        state.viewportFocus = {
+          left: finalScrollLeft,
+          top: finalScrollTop,
+        };
+        state.viewportFocusDelayMs = 0;
+        state.viewportFocusBehavior = "instant";
+        state.viewportFocusSource = null;
+        render();
+      }
+    };
+
+    const touchPointers = () => [...activeTouchPointers.values()];
+    const touchDistance = (first, second) => Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY);
+    const touchMidpoint = (first, second, rect) => ({
+      x: ((first.clientX + second.clientX) / 2) - rect.left,
+      y: ((first.clientY + second.clientY) / 2) - rect.top,
+    });
+
+    const maybeStartPinchZoom = () => {
+      if (!isCompactViewport() || state.editingNoteId || pinchZoom || activeTouchPointers.size < 2) return;
+      const [first, second] = touchPointers();
+      const viewportRect = boardViewport.getBoundingClientRect();
+      const startMidpoint = touchMidpoint(first, second, viewportRect);
+      const startDistance = touchDistance(first, second);
+      if (!Number.isFinite(startDistance) || startDistance < 12) return;
+
+      releaseCurrentInteraction();
+      pinchZoom = {
+        startZoom: state.zoom,
+        currentZoom: state.zoom,
+        startDistance,
+        viewportRect,
+        logicalMidpointX: (boardViewport.scrollLeft + startMidpoint.x) / state.zoom,
+        logicalMidpointY: (boardViewport.scrollTop + startMidpoint.y) / state.zoom,
+      };
+      boardViewport.classList.add("is-pinching");
+    };
+
+    const updatePinchZoom = () => {
+      if (!pinchZoom || activeTouchPointers.size < 2) return;
+      const [first, second] = touchPointers();
+      const currentDistance = touchDistance(first, second);
+      if (!Number.isFinite(currentDistance) || currentDistance <= 0) return;
+
+      const midpoint = touchMidpoint(first, second, pinchZoom.viewportRect);
+      const nextZoom = clampValue(
+        pinchZoom.startZoom * (currentDistance / pinchZoom.startDistance),
+        0.5,
+        2.5
+      );
+      pinchZoom.currentZoom = nextZoom;
+
+      const nextScrollLeft = (pinchZoom.logicalMidpointX * nextZoom) - midpoint.x;
+      const nextScrollTop = (pinchZoom.logicalMidpointY * nextZoom) - midpoint.y;
+      applyBoardViewportVisualLayout({
+        zoom: nextZoom,
+        scrollLeft: nextScrollLeft,
+        scrollTop: nextScrollTop,
+        viewport: boardViewport,
+        viewportContent,
+        canvas: boardCanvas,
+        content: boardContent,
+      });
+    };
+
     boardViewport.addEventListener("scroll", () => {
       updateEditorPanelPosition();
     }, { passive: true });
 
     boardViewport.addEventListener("pointerdown", (event) => {
+      const trackedTouch = updateTrackedTouchPointer(event);
+      if (trackedTouch) {
+        maybeStartPinchZoom();
+        if (pinchZoom) {
+          event.preventDefault();
+          return;
+        }
+      }
       if (event.button !== 0) return;
       if (state.editingNoteId) return;
-      if (event.target.closest(".sticky-note, .floating-bar, .floating-tools, .note-editor-panel, .share-overlay, .users-panel")) return;
+      if (event.target.closest(blockedBoardPanSelector)) return;
       event.preventDefault();
       state.boardPan = {
         pointerId: event.pointerId,
+        pointerType: event.pointerType,
         startX: event.clientX,
         startY: event.clientY,
         scrollLeft: boardViewport.scrollLeft,
         scrollTop: boardViewport.scrollTop,
         moved: false,
       };
-      boardViewport.setPointerCapture(event.pointerId);
+      try {
+        boardViewport.setPointerCapture(event.pointerId);
+      } catch (_error) {
+        // Synthetic pointer events used by tests do not support capture.
+      }
       boardViewport.classList.add("is-panning");
     });
 
     boardViewport.addEventListener("pointermove", (event) => {
+      const trackedTouch = updateTrackedTouchPointer(event);
+      if (trackedTouch && pinchZoom) {
+        event.preventDefault();
+        updatePinchZoom();
+        return;
+      }
       if (!state.boardPan || state.boardPan.pointerId !== event.pointerId) return;
       event.preventDefault();
       const deltaX = event.clientX - state.boardPan.startX;
       const deltaY = event.clientY - state.boardPan.startY;
-      if (Math.abs(deltaX) > 2 || Math.abs(deltaY) > 2) {
+      const threshold = dragIntentThreshold(state.boardPan.pointerType);
+      if (Math.abs(deltaX) > threshold || Math.abs(deltaY) > threshold) {
         state.boardPan.moved = true;
       }
       boardViewport.scrollLeft = state.boardPan.scrollLeft - deltaX;
@@ -3495,13 +4498,20 @@ function renderBoard() {
     });
 
     const endBoardPan = (event) => {
+      if (event?.pointerType === "touch") {
+        clearTrackedTouchPointer(event.pointerId);
+      }
       if (!state.boardPan) return;
       if (event && state.boardPan.pointerId !== event.pointerId) return;
       if (state.boardPan.moved) {
         state.lastBoardPanEndedAt = Date.now();
       }
       if (event && boardViewport.hasPointerCapture?.(event.pointerId)) {
-        boardViewport.releasePointerCapture(event.pointerId);
+        try {
+          boardViewport.releasePointerCapture(event.pointerId);
+        } catch (_error) {
+          // Ignore release failures for synthetic or already-ended pointers.
+        }
       }
       state.boardPan = null;
       boardViewport.classList.remove("is-panning");
@@ -3509,6 +4519,11 @@ function renderBoard() {
 
     boardViewport.addEventListener("pointerup", endBoardPan);
     boardViewport.addEventListener("pointercancel", endBoardPan);
+    boardViewport.addEventListener("pointerleave", (event) => {
+      if (event.pointerType === "touch") {
+        clearTrackedTouchPointer(event.pointerId);
+      }
+    });
 
     boardViewport.addEventListener("wheel", (event) => {
       if (state.boardPan) return;
@@ -3523,6 +4538,7 @@ function renderBoard() {
       event.preventDefault();
       const nextZoom = clampValue(state.zoom + (direction < 0 ? 0.1 : -0.1), 0.5, 2.5);
       setZoomAroundViewportPoint(nextZoom, event.clientX, event.clientY);
+      showZoomIndicator(`${Math.round(state.zoom * 100)}%`);
     }, { passive: false });
   }
 
@@ -3530,14 +4546,16 @@ function renderBoard() {
 
   app.querySelector('[data-action="home"]').addEventListener("click", () => {
     if (state.board?.code) {
-      persistTeacherToken(state.board.code, null);
+      persistAdminToken(state.board.code, null);
     }
     state.view = "home";
     state.board = null;
     state.notes = [];
+    state.labels = [];
     state.members = [];
     state.settingsDraft = null;
     state.selectedNoteId = null;
+    state.selectedLabelId = null;
     state.editingNoteId = null;
     state.qrModalOpen = false;
     state.usersPanelOpen = false;
@@ -3578,6 +4596,16 @@ function renderBoard() {
     }
   });
 
+  app.querySelector('[data-action="add-label"]')?.addEventListener("click", () => {
+    state.modal = {
+      type: "label-editor",
+      labelId: null,
+      text: "",
+      error: "",
+    };
+    render();
+  });
+
   app.querySelectorAll('[data-action="toggle-qr"]').forEach((button) => {
     button.addEventListener("click", () => {
       state.qrModalOpen = !state.qrModalOpen;
@@ -3585,18 +4613,18 @@ function renderBoard() {
     });
   });
 
-  app.querySelector('[data-action="zoom-in"]').addEventListener("click", (event) => {
+  app.querySelector('[data-action="zoom-in"]').addEventListener("click", () => {
     zoomIn();
-    showActionTooltip(event.currentTarget, `${Math.round(state.zoom * 100)}%`);
+    showZoomIndicator(`${Math.round(state.zoom * 100)}%`);
   });
-  app.querySelector('[data-action="zoom-out"]').addEventListener("click", (event) => {
+  app.querySelector('[data-action="zoom-out"]').addEventListener("click", () => {
     zoomOut();
-    showActionTooltip(event.currentTarget, `${Math.round(state.zoom * 100)}%`);
+    showZoomIndicator(`${Math.round(state.zoom * 100)}%`);
   });
-  app.querySelector('[data-action="fit-notes"]').addEventListener("click", (event) => {
+  app.querySelector('[data-action="fit-notes"]').addEventListener("click", () => {
     fitNotesInView();
     window.setTimeout(() => {
-      showActionTooltip(event.currentTarget, `${t("fit_notes")}: ${Math.round(state.zoom * 100)}%`);
+      showZoomIndicator(`${Math.round(state.zoom * 100)}%`);
     }, 0);
   });
   app.querySelector('[data-action="presentation-mode"]').addEventListener("click", () => {
@@ -3610,13 +4638,13 @@ function renderBoard() {
     });
   });
 
-  app.querySelectorAll('[data-action="open-board-teacher-login"]').forEach((button) => {
+  app.querySelectorAll('[data-action="open-board-admin-login"]').forEach((button) => {
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (!state.board?.supervisedMode || isTeacher()) return;
+      if (!isManagementBoard(state.board) || isAdmin()) return;
       state.modal = {
-        type: "teacher-login",
+        type: "admin-login",
         code: state.board.code,
         userName: state.userName,
         pin: "",
@@ -3681,13 +4709,14 @@ function renderBoard() {
   });
 
   app.querySelector(".board-surface").addEventListener("click", (event) => {
-    if (event.target.closest(".sticky-note")) return;
+    if (event.target.closest(".sticky-note, .board-label")) return;
     if (event.target.closest(".floating-bar, .floating-tools, .note-editor-panel, .share-overlay, .users-panel, .app-modal-overlay")) return;
     if (Date.now() - state.lastBoardPanEndedAt < 120) return;
     if (state.editingNoteId) return;
-    if (state.selectedNoteId === null) return;
+    if (state.selectedNoteId === null && state.selectedLabelId === null) return;
     state.editingNoteId = null;
     state.selectedNoteId = null;
+    state.selectedLabelId = null;
     syncEditorPanel();
     render();
   });
@@ -3719,17 +4748,23 @@ function renderBoard() {
     const editor = element.querySelector('[data-role="note-editor"]');
     const inlineSave = element.querySelector('[data-action="save-note-inline"]');
     const inlineCancel = element.querySelector('[data-action="cancel-note-inline"]');
+    const inlineFormatToggle = element.querySelector('[data-action="toggle-mobile-editor-tools"]');
     const isUnsavedNewNote = isLocalNoteId(noteId);
 
     element.addEventListener("pointerdown", (event) => {
       if (state.presentationMode) return;
       if (isUnsavedNewNote) return;
       if (state.editingNoteId === noteId) return;
-      if (event.target.closest('[data-role="note-editor"]') || event.target.closest('[data-action="save-note-inline"]')) return;
+      if (
+        event.target.closest('[data-role="note-editor"]')
+        || event.target.closest('[data-action="save-note-inline"]')
+        || event.target.closest('[data-action="toggle-like"]')
+      ) return;
       const activeNote = getRenderableNote(noteId);
       if (!activeNote) return;
       if (!canMoveNote(activeNote)) {
         state.selectedNoteId = noteId;
+        state.selectedLabelId = null;
         if (!state.editingNoteId && canEditNote(activeNote)) {
           openNoteEditor(noteId);
         } else {
@@ -3738,10 +4773,14 @@ function renderBoard() {
         return;
       }
       state.selectedNoteId = noteId;
+      state.selectedLabelId = null;
       state.editingNoteId = null;
       bringToFront(noteId);
+      element.style.zIndex = String(getRenderableNote(noteId)?.zIndex || activeNote.zIndex);
       state.drag = {
-        noteId,
+        type: "note",
+        id: noteId,
+        pointerType: event.pointerType,
         startX: event.clientX,
         startY: event.clientY,
         originX: activeNote.x,
@@ -3752,10 +4791,11 @@ function renderBoard() {
     });
 
     element.addEventListener("pointermove", (event) => {
-      if (!state.drag || state.drag.noteId !== noteId) return;
+      if (!state.drag || state.drag.type !== "note" || state.drag.id !== noteId) return;
       const deltaX = (event.clientX - state.drag.startX) / state.zoom;
       const deltaY = (event.clientY - state.drag.startY) / state.zoom;
-       if (Math.abs(deltaX) > 2 || Math.abs(deltaY) > 2) {
+      const threshold = dragIntentThreshold(state.drag.pointerType) / state.zoom;
+      if (Math.abs(deltaX) > threshold || Math.abs(deltaY) > threshold) {
         state.drag.moved = true;
       }
       const movingNote = state.editingNoteId === noteId ? ensureDraft(noteId) : getNoteById(noteId);
@@ -3767,7 +4807,7 @@ function renderBoard() {
     });
 
     element.addEventListener("pointerup", (event) => {
-      if (!state.drag || state.drag.noteId !== noteId) return;
+      if (!state.drag || state.drag.type !== "note" || state.drag.id !== noteId) return;
       const moved = state.drag.moved;
       const movingNote = state.editingNoteId === noteId ? ensureDraft(noteId) : getNoteById(noteId);
       state.drag = null;
@@ -3786,7 +4826,6 @@ function renderBoard() {
       }
       if (moved && movingNote && state.editingNoteId !== noteId) {
         saveNoteDebounced(movingNote);
-        render();
         return;
       }
       if (!moved) {
@@ -3800,6 +4839,7 @@ function renderBoard() {
         }
         if (!canEditNote(getRenderableNote(noteId))) {
           state.selectedNoteId = noteId;
+          state.selectedLabelId = null;
           render();
           return;
         }
@@ -3812,6 +4852,7 @@ function renderBoard() {
     if (editor) {
       editor.addEventListener("focus", () => {
         state.selectedNoteId = noteId;
+        state.selectedLabelId = null;
         state.editingNoteId = noteId;
         ensureDraft(noteId);
         bringToFront(noteId);
@@ -3874,6 +4915,163 @@ function renderBoard() {
         cancelNote(noteId);
       });
     }
+
+    if (inlineFormatToggle) {
+      inlineFormatToggle.addEventListener("click", () => {
+        if (state.editingNoteId !== noteId) return;
+        state.mobileEditorToolsOpen = !state.mobileEditorToolsOpen;
+        state.pendingEditorFocusNoteId = noteId;
+        render();
+      });
+    }
+  });
+
+  app.querySelectorAll(".board-label").forEach((element) => {
+    const labelId = Number(element.dataset.labelId);
+
+    element.addEventListener("pointerdown", (event) => {
+      if (state.presentationMode) return;
+      if (state.editingNoteId) return;
+      if (event.target.closest("[data-action='edit-label'], [data-action='delete-label'], [data-action='increase-label-size'], [data-action='decrease-label-size']")) return;
+      const activeLabel = getLabelById(labelId);
+      if (!activeLabel) return;
+
+      state.selectedLabelId = labelId;
+      state.selectedNoteId = null;
+      if (!canMoveLabel(activeLabel)) {
+        render();
+        return;
+      }
+
+      bringLabelToFront(labelId);
+      element.style.zIndex = String(getLabelById(labelId)?.zIndex || activeLabel.zIndex);
+      state.drag = {
+        type: "label",
+        id: labelId,
+        pointerType: event.pointerType,
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: activeLabel.x,
+        originY: activeLabel.y,
+        moved: false,
+      };
+      element.setPointerCapture(event.pointerId);
+    });
+
+    element.addEventListener("pointermove", (event) => {
+      if (!state.drag || state.drag.type !== "label" || state.drag.id !== labelId) return;
+      const movingLabel = getLabelById(labelId);
+      if (!movingLabel) return;
+      const metrics = labelMetrics(movingLabel);
+      const deltaX = (event.clientX - state.drag.startX) / state.zoom;
+      const deltaY = (event.clientY - state.drag.startY) / state.zoom;
+      const threshold = dragIntentThreshold(state.drag.pointerType) / state.zoom;
+      if (Math.abs(deltaX) > threshold || Math.abs(deltaY) > threshold) {
+        state.drag.moved = true;
+      }
+      const clamped = clampLabelPosition(
+        Math.round(state.drag.originX + deltaX),
+        Math.round(state.drag.originY + deltaY),
+        metrics.width,
+        metrics.height
+      );
+      movingLabel.x = clamped.x;
+      movingLabel.y = clamped.y;
+      element.style.left = `${clamped.x}px`;
+      element.style.top = `${clamped.y}px`;
+    });
+
+    element.addEventListener("pointerup", (event) => {
+      if (!state.drag || state.drag.type !== "label" || state.drag.id !== labelId) return;
+      const moved = state.drag.moved;
+      const movingLabel = getLabelById(labelId);
+      state.drag = null;
+      if (moved && movingLabel) {
+        persistLabel(movingLabel).catch((error) => {
+          showToast(error.message, true);
+          render();
+        });
+        return;
+      }
+      render();
+    });
+
+    element.addEventListener("dblclick", () => {
+      const activeLabel = getLabelById(labelId);
+      if (!activeLabel || !canEditLabel(activeLabel)) return;
+      state.modal = {
+        type: "label-editor",
+        labelId,
+        text: activeLabel.text,
+        error: "",
+      };
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="edit-label"]').forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const labelId = Number(button.dataset.id);
+      const label = getLabelById(labelId);
+      if (!label) return;
+      state.modal = {
+        type: "label-editor",
+        labelId,
+        text: label.text,
+        error: "",
+      };
+      render();
+    });
+  });
+
+  app.querySelectorAll('[data-action="increase-label-size"]').forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await adjustLabelFontSize(Number(button.dataset.id), LABEL_FONT_SIZE_STEP);
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    });
+  });
+
+  app.querySelectorAll('[data-action="decrease-label-size"]').forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await adjustLabelFontSize(Number(button.dataset.id), -LABEL_FONT_SIZE_STEP);
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    });
+  });
+
+  app.querySelectorAll('[data-action="delete-label"]').forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await deleteLabel(Number(button.dataset.id));
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    });
+  });
+
+  app.querySelectorAll('[data-action="toggle-like"]').forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await toggleNoteLike(Number(button.dataset.id));
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    });
   });
 
   app.querySelectorAll('[data-action="kick-user"]').forEach((button) => {
@@ -3901,7 +5099,7 @@ function renderBoard() {
 }
 
 function renderUsersPanel() {
-  if (!isTeacher() || !state.usersPanelOpen) return "";
+  if (!isAdmin() || !state.usersPanelOpen) return "";
 
   return `
     <div class="share-overlay users-overlay">
@@ -3911,8 +5109,8 @@ function renderUsersPanel() {
           <button class="link-button" data-action="toggle-users" type="button">${t("close")}</button>
         </div>
         <div class="users-list">
-          ${state.members.filter((member) => !member.isTeacher).length === 0 ? `<p class="qr-hint">${t("no_active_users")}</p>` : ""}
-          ${state.members.filter((member) => !member.isTeacher).map((member) => `
+          ${state.members.filter((member) => !memberHasAdminAccess(member)).length === 0 ? `<p class="qr-hint">${t("no_active_users")}</p>` : ""}
+          ${state.members.filter((member) => !memberHasAdminAccess(member)).map((member) => `
             <div class="user-row">
               <div>
                 <strong>${escapeHtml(member.userName)}</strong>
@@ -3963,6 +5161,7 @@ function renderNoteCard(note) {
   const isSettling = state.settlingNoteId === note.id;
   const isUnsavedNewNote = isLocalNoteId(note.id);
   const noteCanEdit = canEditNote(renderable);
+  const isMobileEditor = isEditing && noteCanEdit && isCompactViewport();
   const noteRotation = (isUnsavedNewNote || isEditing) ? "0deg" : "calc((var(--tilt, 0) * 1deg))";
   const noteScale = isEditing
     ? Number((editingNoteScale() * (isUnsavedNewNote ? 1.02 : 1)).toFixed(4))
@@ -3991,6 +5190,18 @@ function renderNoteCard(note) {
         <span class="note-author">${escapeHtml(renderable.author || state.userName)}</span>
         ${isEditing && noteCanEdit ? `
           <div class="note-inline-actions">
+            ${isMobileEditor ? `
+              <button
+                class="note-format-toggle-button ${state.mobileEditorToolsOpen ? "active" : ""}"
+                data-action="toggle-mobile-editor-tools"
+                data-id="${note.id}"
+                type="button"
+                data-tooltip="Aa"
+                aria-label="Aa"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 19 9.3 5h1.9L16 19h-2.1l-1.1-3.4H7.7L6.6 19Zm3.8-5.2H12L10.2 8.4ZM17 8h2l2 6 2-6h2l-3.4 9.2c-.2.6-.5 1.1-.9 1.5-.4.4-1 .6-1.8.6h-1v-1.7h.7c.4 0 .7-.1.9-.3.2-.2.4-.4.5-.8l.2-.5Z" fill="currentColor"/></svg>
+              </button>
+            ` : ""}
             <button
               class="note-save-button"
               data-action="save-note-inline"
@@ -4018,6 +5229,21 @@ function renderNoteCard(note) {
         <div class="note-editor" contenteditable="true" spellcheck="true" data-role="note-editor" data-id="${note.id}">${sanitizeRichText(renderable.content || "")}</div>
       ` : `
         <div class="note-display">${sanitizeRichText(renderable.content || "").trim() || `<span class="note-placeholder">${escapeHtml(t("note_placeholder"))}</span>`}</div>
+        ${likesEnabled() ? `
+          <footer class="note-footer">
+            <button
+              class="note-like-button ${renderable.isLikedByCurrentUser ? "active" : ""}"
+              data-action="toggle-like"
+              data-id="${note.id}"
+              type="button"
+              data-tooltip="${renderable.isLikedByCurrentUser ? t("unlike_note") : t("like_note")}"
+              aria-label="${renderable.isLikedByCurrentUser ? t("unlike_note") : t("like_note")}"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6.72-4.34-9.2-8.06C.63 9.74 2.24 5 6.46 5c2.13 0 3.36 1.16 4.19 2.3C11.48 6.16 12.71 5 14.84 5 19.06 5 20.67 9.74 18.2 12.94 15.72 16.66 9 21 9 21Z" fill="currentColor"/></svg>
+              <span>${Number(renderable.likesCount) || 0}</span>
+            </button>
+          </footer>
+        ` : ""}
       `}
     </article>
   `;
@@ -4059,18 +5285,28 @@ async function bootstrap() {
     state.lang = "en";
     state.translations = await loadTranslations("en");
   }
+  state.fallbackTranslations = state.lang === "en"
+    ? state.translations
+    : await loadTranslations("en").catch(() => ({}));
   persistLanguage(state.lang);
   applyDocumentLanguage(state.lang);
 
   ensureClientId();
   loadUserName();
+  updateViewportEnvironment();
   render();
+
+  const handleViewportEnvironmentChange = () => {
+    updateViewportEnvironment();
+    syncEditorPanel();
+    updateEditorPanelPosition();
+  };
 
   const code = boardCodeFromUrl();
   if (code) {
-    loadTeacherToken(code);
+    loadAdminToken(code);
     try {
-      if (state.teacherToken) {
+      if (state.adminToken) {
         await openBoard(code);
       } else {
         promptDirectBoardJoin(code);
@@ -4085,6 +5321,10 @@ async function bootstrap() {
       refreshBoard().catch(() => {});
     }
   }, 6000);
+
+  window.addEventListener("resize", handleViewportEnvironmentChange);
+  window.visualViewport?.addEventListener("resize", handleViewportEnvironmentChange);
+  window.visualViewport?.addEventListener("scroll", handleViewportEnvironmentChange);
 
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {

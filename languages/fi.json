@@ -26,7 +26,7 @@
   "discard_changes": "Hylkaa muutokset",
   "decrease_font_size": "Pienempi teksti",
   "increase_font_size": "Suurempi teksti",
-  "supervised_mode": "Valvottu tila",
+  "supervised_mode": "Hallintatila",
   "login_with_pin": "Kirjaudu PIN-koodilla",
   "pin_code": "PIN-koodi",
   "choose_pin_title": "Valitse 4-numeroinen PIN-koodi",

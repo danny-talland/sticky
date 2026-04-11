@@ -1,12 +1,12 @@
 const { test, expect } = require("@playwright/test");
 
-async function createBoard(request) {
+async function createBoard(request, managementMode = false) {
   const clientId = `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const response = await request.post("./api.php?action=create_board", {
     data: {
       title: "PW Board Interactions",
-      supervisedMode: false,
-      teacherName: "Playwright",
+      managementMode,
+      adminName: "Playwright",
       clientId,
     },
   });
@@ -46,6 +46,15 @@ async function openSharedBoard(page, code, userName = "Playwright") {
     await nameInput.fill(userName);
     await page.locator('[data-action="submit-direct-board"]').click();
   }
+  await page.waitForSelector(".board-viewport");
+}
+
+async function openAdminBoard(page, board, adminToken, userName = "Playwright") {
+  await page.addInitScript(({ code, token, storedUserName }) => {
+    window.localStorage.setItem(`sticky.adminToken.${code}`, token);
+    window.localStorage.setItem("sticky.userName", storedUserName);
+  }, { code: board.code, token: adminToken, storedUserName: userName });
+  await page.goto(`./?board=${board.code}`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(".board-viewport");
 }
 
@@ -113,6 +122,128 @@ test.describe("board interactions", () => {
     await expect(page.locator(".qr-image")).toBeVisible();
   });
 
+  test("likes a sticky once and allows toggling that like back off", async ({ page, request }) => {
+    const created = await createBoard(request);
+    await createSeedNote(request, {
+      code: created.board.code,
+      clientId: created.clientId,
+      x: 120,
+      y: 120,
+      content: "Like target",
+      zIndex: 1,
+    });
+
+    await openSharedBoard(page, created.board.code);
+
+    const likeButton = page.locator(".sticky-note", { hasText: "Like target" }).locator('[data-action="toggle-like"]');
+    await expect(likeButton).toContainText("0");
+
+    await likeButton.click();
+    await expect(likeButton).toHaveClass(/active/);
+    await expect(likeButton).toContainText("1");
+
+    await likeButton.click();
+    await expect(likeButton).not.toHaveClass(/active/);
+    await expect(likeButton).toContainText("0");
+  });
+
+  test("creates and renders board labels from the board UI and lets the user resize them", async ({ page, request }) => {
+    const created = await createBoard(request);
+    await openSharedBoard(page, created.board.code);
+
+    await expect(page.locator(".floating-tools [data-action='add-label']")).toBeVisible();
+    await expect(page.locator(".add-label-fab")).toHaveCount(0);
+    await page.click('[data-action="add-label"]');
+    await page.locator('[data-form="label-editor-modal"] input[name="text"]').fill("Sprint 1");
+    await page.locator('[data-form="label-editor-modal"] button[type="submit"]').click();
+
+    const labelText = page.locator(".board-label-text", { hasText: "Sprint 1" });
+    await expect(labelText).toBeVisible();
+
+    const initialFontSize = await labelText.evaluate((element) => Number.parseFloat(window.getComputedStyle(element).fontSize));
+    await page.locator('[data-action="increase-label-size"]').click();
+    await expect.poll(async () => labelText.evaluate((element) => Number.parseFloat(window.getComputedStyle(element).fontSize))).toBeGreaterThan(initialFontSize);
+
+    await page.locator('[data-action="decrease-label-size"]').click();
+    await expect.poll(async () => labelText.evaluate((element) => Number.parseFloat(window.getComputedStyle(element).fontSize))).toBe(initialFontSize);
+  });
+
+  test("shows label creation only to admins on management boards", async ({ page, request }) => {
+    const created = await createBoard(request, true);
+
+    await openSharedBoard(page, created.board.code, "Regular User");
+    await expect(page.locator(".floating-tools [data-action='add-label']")).toHaveCount(0);
+
+    await openAdminBoard(page, created.board, created.adminToken);
+    await expect(page.locator(".floating-tools [data-action='add-label']")).toBeVisible();
+  });
+
+  test("renders centered board divider lines and hides likes when management settings disable them", async ({ page, request }) => {
+    const created = await createBoard(request, true);
+    await createSeedNote(request, {
+      code: created.board.code,
+      clientId: created.clientId,
+      x: 120,
+      y: 120,
+      content: "Guided board note",
+      zIndex: 1,
+    });
+
+    const updateResponse = await request.post("./api.php?action=update_management_settings", {
+      data: {
+        code: created.board.code,
+        adminToken: created.adminToken,
+        settings: {
+          allowViewerCreateNotes: true,
+          allowOnlyOwnMove: true,
+          allowOnlyOwnDelete: true,
+          allowOnlyOwnEdit: true,
+          likesEnabled: false,
+          maxNotesPerUser: 10,
+          maxBoardColumns: 10,
+          maxBoardRows: 5,
+          lineColumns: 1,
+          lineRows: 1,
+          kickBlockMinutes: 15,
+        },
+      },
+    });
+    expect(updateResponse.ok()).toBeTruthy();
+    const updated = await updateResponse.json();
+    expect(updated.board.settings.lineColumns).toBe(2);
+    expect(updated.board.settings.lineRows).toBe(2);
+
+    await openAdminBoard(page, created.board, created.adminToken);
+
+    await expect(page.locator(".board-guide-grid.has-columns.has-rows")).toBeVisible();
+    await expect(page.locator(".board-guide-line.vertical")).toHaveCount(1);
+    await expect(page.locator(".board-guide-line.horizontal")).toHaveCount(1);
+    await expect(page.locator(".sticky-note [data-action='toggle-like']")).toHaveCount(0);
+
+    const lineMetrics = await page.evaluate(() => {
+      const grid = document.querySelector(".board-guide-grid");
+      const vertical = document.querySelector(".board-guide-line.vertical");
+      const horizontal = document.querySelector(".board-guide-line.horizontal");
+      if (!grid || !vertical || !horizontal) {
+        throw new Error("Missing board guide lines");
+      }
+
+      const gridRect = grid.getBoundingClientRect();
+      const verticalRect = vertical.getBoundingClientRect();
+      const horizontalRect = horizontal.getBoundingClientRect();
+
+      return {
+        gridCenterX: gridRect.left + (gridRect.width / 2),
+        gridCenterY: gridRect.top + (gridRect.height / 2),
+        verticalX: verticalRect.left + (verticalRect.width / 2),
+        horizontalY: horizontalRect.top + (horizontalRect.height / 2),
+      };
+    });
+
+    expect(Math.abs(lineMetrics.verticalX - lineMetrics.gridCenterX)).toBeLessThanOrEqual(1);
+    expect(Math.abs(lineMetrics.horizontalY - lineMetrics.gridCenterY)).toBeLessThanOrEqual(1);
+  });
+
   test("supports board panning and keeps the grid on the scrolling board layer", async ({ page, request }) => {
     const created = await createBoard(request);
 
@@ -149,6 +280,43 @@ test.describe("board interactions", () => {
     expect(after.top).not.toBe(before.top);
     expect(before.surface).not.toContain("linear-gradient(90deg");
     expect(before.canvas).toContain("linear-gradient(90deg");
+  });
+
+  test("does not rebuild the board viewport after dragging a sticky", async ({ page, request }) => {
+    const created = await createBoard(request);
+    await createSeedNote(request, {
+      code: created.board.code,
+      clientId: created.clientId,
+      x: 180,
+      y: 180,
+      content: "Drag target",
+      zIndex: 1,
+    });
+
+    await openSharedBoard(page, created.board.code);
+    await page.waitForTimeout(250);
+
+    await page.evaluate(() => {
+      window.__stickyViewportRef = document.querySelector(".board-viewport");
+    });
+
+    const note = page.locator(".sticky-note", { hasText: "Drag target" });
+    const before = await note.boundingBox();
+    expect(before).toBeTruthy();
+
+    await page.mouse.move(before.x + (before.width / 2), before.y + (before.height / 2));
+    await page.mouse.down();
+    await page.mouse.move(before.x + (before.width / 2) + 90, before.y + (before.height / 2) + 70, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(120);
+
+    const result = await page.evaluate(() => {
+      return {
+        sameViewport: window.__stickyViewportRef === document.querySelector(".board-viewport"),
+      };
+    });
+
+    expect(result.sameViewport).toBe(true);
   });
 
   test("preserves the viewport position after the automatic board refresh", async ({ page, request }) => {
@@ -981,6 +1149,7 @@ test.describe("board interactions", () => {
     });
 
     await page.click('[data-action="zoom-in"]');
+    await expect(page.locator(".zoom-indicator")).toHaveText(/\d+%/);
     await page.waitForTimeout(500);
 
     const afterZoomIn = await page.evaluate(() => {
@@ -1052,6 +1221,7 @@ test.describe("board interactions", () => {
 
     await page.mouse.move(targetPoint.clientX, targetPoint.clientY);
     await page.mouse.wheel(0, -140);
+    await expect(page.locator(".zoom-indicator")).toHaveText(/\d+%/);
     await page.waitForTimeout(220);
 
     const after = await page.evaluate(({ clientX, clientY }) => {
@@ -1069,6 +1239,26 @@ test.describe("board interactions", () => {
     expect(after.zoom).toBeGreaterThan(before.zoom);
     expect(Math.abs(after.logicalX - before.logicalX)).toBeLessThanOrEqual(2);
     expect(Math.abs(after.logicalY - before.logicalY)).toBeLessThanOrEqual(2);
+  });
+
+  test("snaps section counts away from 1 in the management settings form but still allows 3", async ({ page, request }) => {
+    const created = await createBoard(request, true);
+    await openAdminBoard(page, created.board, created.adminToken);
+
+    await page.click('[data-action="open-settings"]');
+
+    const horizontalField = page.locator('[data-form="management-settings"] input[name="lineColumns"]');
+    const verticalField = page.locator('[data-form="management-settings"] input[name="lineRows"]');
+
+    await horizontalField.fill("1");
+    await verticalField.fill("1");
+    await expect(horizontalField).toHaveValue("2");
+    await expect(verticalField).toHaveValue("2");
+
+    await horizontalField.fill("3");
+    await verticalField.fill("3");
+    await expect(horizontalField).toHaveValue("3");
+    await expect(verticalField).toHaveValue("3");
   });
 
   test("keeps fit-view stable while a new note is edited and returns the note to board scale after save", async ({ page, request }) => {

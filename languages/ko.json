@@ -26,7 +26,7 @@
   "discard_changes": "변경 취소",
   "decrease_font_size": "텍스트 작게",
   "increase_font_size": "텍스트 크게",
-  "supervised_mode": "감독 모드",
+  "supervised_mode": "관리 모드",
   "login_with_pin": "PIN으로 로그인",
   "pin_code": "PIN 코드",
   "choose_pin_title": "4자리 PIN 코드를 선택하세요",

@@ -26,7 +26,7 @@
   "discard_changes": "ยกเลิกการเปลี่ยนแปลง",
   "decrease_font_size": "ข้อความเล็กลง",
   "increase_font_size": "ข้อความใหญ่ขึ้น",
-  "supervised_mode": "โหมดควบคุม",
+  "supervised_mode": "โหมดจัดการ",
   "login_with_pin": "เข้าสู่ระบบด้วย PIN",
   "pin_code": "รหัส PIN",
   "choose_pin_title": "เลือกรหัส PIN 4 หลัก",
